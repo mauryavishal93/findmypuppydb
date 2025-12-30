@@ -4,6 +4,7 @@ import cors from 'cors';
 import bcrypt from 'bcrypt';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { existsSync } from 'fs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -234,16 +235,27 @@ app.get('/api/user/:username', async (req, res) => {
 });
 
 // --- SERVE STATIC FRONTEND (For Web Version) ---
-// Serve static files from the 'dist' directory
-app.use(express.static(path.join(__dirname, 'dist')));
+// Only serve static files if 'dist' directory exists
+const distPath = path.join(__dirname, 'dist');
+if (existsSync(distPath)) {
+  // Serve static files from the 'dist' directory
+  app.use(express.static(distPath));
 
-// Handle React Routing, return all requests to React app
-app.get('*', (req, res) => {
-  // If request is not an API call, serve index.html
-  if (!req.path.startsWith('/api')) {
-    res.sendFile(path.join(__dirname, 'dist', 'index.html'));
-  }
-});
+  // Handle React Routing, return all requests to React app
+  app.get('*', (req, res) => {
+    // If request is not an API call, serve index.html
+    if (!req.path.startsWith('/api')) {
+      res.sendFile(path.join(distPath, 'index.html'));
+    }
+  });
+} else {
+  // If dist doesn't exist, just handle API routes
+  app.get('*', (req, res) => {
+    if (!req.path.startsWith('/api')) {
+      res.status(404).json({ message: 'Frontend not built. API server only.' });
+    }
+  });
+}
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Production Server running on port ${PORT}`);
