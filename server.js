@@ -9,15 +9,15 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-// Render uses process.env.PORT. Fallback to 5000 for local testing.
-const PORT = process.env.PORT || 5000;
+// Render uses process.env.PORT. Fallback to 5177 for local testing.
+const PORT = process.env.PORT || 5177;
 
 // Middleware
 // Allow CORS so your mobile app (which runs on a different origin) can hit this API
 app.use(cors()); 
 app.use(express.json());
 
-// MongoDB Connection
+// MongoDB Connectionßßß
 // Use Environment Variable for security in production, fallback to string for local
 const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://vimaurya24_db_user:jrPF6GqaTX9H40s1@findmypuppy.q6hlrak.mongodb.net/findmypuppy?appName=findmypuppy";
 const COLLECTION_NAME = "user";
