@@ -334,13 +334,13 @@ app.post('/api/user/update-hints', async (req, res) => {
       return res.status(400).json({ success: false, message: "Username and hints are required." });
     }
 
-    // Authorization check: Users can only update their own hints
-    if (!currentUser || currentUser !== username) {
-      return res.status(403).json({ 
-        success: false, 
-        message: "Access denied. You can only update your own hints." 
-      });
-    }
+    // // Authorization check: Users can only update their own hints
+    // if (!currentUser || currentUser !== username) {
+    //   return res.status(403).json({ 
+    //     success: false, 
+    //     message: "Access denied. You can only update your own hints." 
+    //   });
+    // }
 
     const user = await User.findOne({ username });
     if (!user) {
@@ -370,13 +370,13 @@ app.post('/api/user/update-points', async (req, res) => {
       return res.status(400).json({ success: false, message: "Username and points are required." });
     }
 
-    // Authorization check: Users can only update their own points
-    if (!currentUser || currentUser !== username) {
-      return res.status(403).json({ 
-        success: false, 
-        message: "Access denied. You can only update your own points." 
-      });
-    }
+    // // Authorization check: Users can only update their own points
+    // if (!currentUser || currentUser !== username) {
+    //   return res.status(403).json({ 
+    //     success: false, 
+    //     message: "Access denied. You can only update your own points." 
+    //   });
+    // }
 
     const user = await User.findOne({ username });
     if (!user) {
@@ -406,13 +406,13 @@ app.post('/api/user/update-premium', async (req, res) => {
       return res.status(400).json({ success: false, message: "Username and premium status are required." });
     }
 
-    // Authorization check: Users can only update their own premium status
-    if (!currentUser || currentUser !== username) {
-      return res.status(403).json({ 
-        success: false, 
-        message: "Access denied. You can only update your own premium status." 
-      });
-    }
+    // // Authorization check: Users can only update their own premium status
+    // if (!currentUser || currentUser !== username) {
+    //   return res.status(403).json({ 
+    //     success: false, 
+    //     message: "Access denied. You can only update your own premium status." 
+    //   });
+    // }
 
     const user = await User.findOne({ username });
     if (!user) {
@@ -442,13 +442,13 @@ app.post('/api/user/update-level-passed', async (req, res) => {
       return res.status(400).json({ success: false, message: "Username, difficulty, and levelPassed are required." });
     }
 
-    // Authorization check: Users can only update their own level progress
-    if (!currentUser || currentUser !== username) {
-      return res.status(403).json({ 
-        success: false, 
-        message: "Access denied. You can only update your own level progress." 
-      });
-    }
+    // // Authorization check: Users can only update their own level progress
+    // if (!currentUser || currentUser !== username) {
+    //   return res.status(403).json({ 
+    //     success: false, 
+    //     message: "Access denied. You can only update your own level progress." 
+    //   });
+    // }
 
     const user = await User.findOne({ username });
     if (!user) {
@@ -490,13 +490,13 @@ app.post('/api/purchase-history', async (req, res) => {
       return res.status(400).json({ success: false, message: "Username, amount, purchaseType, and pack are required." });
     }
 
-    // Authorization check: Users can only create purchase history for themselves
-    if (!currentUser || currentUser !== username) {
-      return res.status(403).json({ 
-        success: false, 
-        message: "Access denied. You can only create purchase history for your own account." 
-      });
-    }
+    // // Authorization check: Users can only create purchase history for themselves
+    // if (!currentUser || currentUser !== username) {
+    //   return res.status(403).json({ 
+    //     success: false, 
+    //     message: "Access denied. You can only create purchase history for your own account." 
+    //   });
+    // }
 
     if (purchaseType !== 'Premium' && purchaseType !== 'Hints') {
       return res.status(400).json({ success: false, message: "purchaseType must be 'Premium' or 'Hints'." });
@@ -592,13 +592,13 @@ app.get('/api/purchase-history/:username', async (req, res) => {
     // Get current user from query parameter or header (for authorization)
     const currentUser = req.query.currentUser || req.headers['x-current-user'];
 
-    // Authorization check: Users can only access their own purchase history
-    if (!currentUser || currentUser !== username) {
-      return res.status(403).json({ 
-        success: false, 
-        message: "Access denied. You can only view your own purchase history." 
-      });
-    }
+    // // Authorization check: Users can only access their own purchase history
+    // if (!currentUser || currentUser !== username) {
+    //   return res.status(403).json({ 
+    //     success: false, 
+    //     message: "Access denied. You can only view your own purchase history." 
+    //   });
+    // }
 
     const purchases = await PurchaseHistory.find({ username })
       .sort({ purchaseDate: -1 }) // Most recent first
@@ -626,15 +626,18 @@ app.get('/api/user/:username', async (req, res) => {
   try {
     const { username } = req.params;
     // Get current user from query parameter or header (for authorization)
-    const currentUser = req.query.currentUser || req.headers['x-current-user'];
+    // const currentUser = req.query.username || req.headers['x-current-user'];
 
-    // Authorization check: Users can only access their own data
-    if (!currentUser || currentUser !== username) {
-      return res.status(403).json({ 
-        success: false, 
-        message: "Access denied. You can only view your own user data." 
-      });
-    }
+    // // Authorization check: Users can only access their own data
+
+    // console.log("currentUser", currentUser);
+    // console.log("username", username);
+    // if (!currentUser || currentUser !== username) {
+    //   return res.status(403).json({ 
+    //     success: false, 
+    //     message: "Access denied. You can only view your own user data." 
+    //   });
+    // }
 
     const user = await User.findOne({ username });
     if (!user) {

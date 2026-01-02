@@ -51,7 +51,7 @@ const purchaseHistorySchema = new mongoose.Schema({
   amount: { type: Number, required: true },
   purchaseType: { type: String, required: true, enum: ['Premium', 'Hints'] },
   pack: { type: String, required: true }, 
-  purchaseMode: { type: String, enum: ['Money', 'Points'], default: 'Money' }
+  purchaseMode: { type: String, enum: ['Money', 'Points', 'Referral'], default: 'Money' }
 }, { collection: 'purchaseHistory' });
 
 const PurchaseHistory = mongoose.model('PurchaseHistory', purchaseHistorySchema);
@@ -216,7 +216,7 @@ app.get('/api/purchase-history/:username', async (req, res) => {
 app.get('/api/user/:username', async (req, res) => {
   try {
     const { username } = req.params;
-    const user = await User.findOne({ username });
+    //const user = await User.findOne({ username });
     if (!user) return res.status(404).json({ success: false, message: "User not found." });
     res.status(200).json({ 
       success: true, 
