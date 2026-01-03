@@ -109,26 +109,32 @@ const initializePriceOffer = async () => {
 mongoose.connection.once('open', async () => {
   initializePriceOffer();
   
-  // Migration: Ensure all existing users have the 'referredBy' field
-  try {
-    // 1. Add field if missing
-    await User.updateMany(
-      { referredBy: { $exists: false } },
-      { $set: { referredBy: "" } }
-    );
-    
-    // 2. Convert empty strings to null for better clarity
+   // Migration: Ensure all existing users have the 'referredBy' field
+   try {
+    // 1. Add referredBy only where it is missing, null, or empty
     const result = await User.updateMany(
-      { referredBy: null },
-      { $set: { referredBy: "" } }
+      {
+        $or: [
+          { referredBy: { $exists: false } },
+          { referredBy: null },
+          { referredBy: "" }
+        ]
+      },
+      {
+        $set: { referredBy: "" }
+      }
     );
     
     if (result.modifiedCount > 0) {
-      console.log(`✅ Database Migration: Cleaned up 'referredBy' field for ${result.modifiedCount} users.`);
+      console.log(
+        `✅ Database Migration: Updated 'referredBy' for ${result.modifiedCount} users`
+      );
+    } else {
+      console.log("ℹ️ No records needed migration");
     }
   } catch (error) {
-    console.error('⚠️ Migration Error:', error);
-  }
+    console.error("⚠️ Migration Error:", error);
+  }  
 });
 
 // --- ROUTES ---
