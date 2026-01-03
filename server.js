@@ -60,7 +60,7 @@ const purchaseHistorySchema = new mongoose.Schema({
   purchaseType: { type: String, required: true, enum: ['Premium', 'Hints'] },
   pack: { type: String, required: true }, // Hint count or Premium type
   // How the purchase was made: 'Money' (₹) or 'Points' (Pts)
-  purchaseMode: { type: String, enum: ['Money', 'Points'], default: 'Money' }
+  purchaseMode: { type: String, enum: ['Money', 'Points','Referral'], default: 'Money' }
 }, { collection: 'purchaseHistory' });
 
 const PurchaseHistory = mongoose.model('PurchaseHistory', purchaseHistorySchema);
