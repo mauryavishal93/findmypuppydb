@@ -20,7 +20,7 @@ const __dirname = dirname(__filename);
 
 const app = express();
 // Professional SRE Rule: Always allow the environment to override the PORT
-const PORT = process.env.PORT || 5774;
+const PORT = process.env.PORT || 5274;
 
 // Razorpay Configuration (Use Environment Variables for Production)
 const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID || 'rzp_test_RyzZQD56IABhEH';
@@ -1096,7 +1096,7 @@ app.listen(PORT, () => {
         res.status(404).send('Application not built. Please run "npm run build".');
       }
     });
-  } else {
+  } else if (process.env.SKIP_VITE !== 'true') {
     // Start the frontend dev server ONLY in development
     console.log('📦 Starting frontend dev server...');
     const viteProcess = spawn('npm', ['run', 'dev'], {
@@ -1118,13 +1118,13 @@ app.listen(PORT, () => {
   // Handle graceful shutdown
   process.on('SIGINT', () => {
     console.log('\n🛑 Shutting down servers...');
-    viteProcess.kill();
+    if (typeof viteProcess !== 'undefined') viteProcess.kill();
     process.exit(0);
   });
   
   process.on('SIGTERM', () => {
     console.log('\n🛑 Shutting down servers...');
-    viteProcess.kill();
+    if (typeof viteProcess !== 'undefined') viteProcess.kill();
     process.exit(0);
   });
   }
