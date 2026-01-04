@@ -6,21 +6,56 @@ import bcrypt from 'bcrypt';
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import Razorpay from 'razorpay';
+import crypto from 'crypto';
+import fs from 'fs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 const app = express();
-const PORT = 5174;
+// Professional SRE Rule: Always allow the environment to override the PORT
+const PORT = process.env.PORT || 57174;
+
+// Razorpay Configuration (Use Environment Variables for Production)
+const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID || 'rzp_test_RyzZQD56IABhEH';
+const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET || 'Ny5tgTW7aCJMhAizWWGvOSDZ';
+
+const razorpay = new Razorpay({
+  key_id: RAZORPAY_KEY_ID,
+  key_secret: RAZORPAY_KEY_SECRET,
+});
+
+console.log(`💳 Razorpay Initialized with Key ID: ${RAZORPAY_KEY_ID.substring(0, 8)}...`);
 
 // Middleware
 app.use(cors());
 app.use(express.json());
 
+// Serve static files from the 'dist' directory in production
+const isProduction = process.env.NODE_ENV === 'production' || process.env.RENDER === 'true';
+const distPath = join(__dirname, 'dist');
+
+console.log('--- Deployment Diagnostics ---');
+console.log(`Node version: ${process.version}`);
+console.log(`Current Dir: ${__dirname}`);
+console.log(`Target Dist Path: ${distPath}`);
+console.log(`Environment: ${process.env.NODE_ENV}`);
+
+if (isProduction) {
+  if (fs.existsSync(distPath)) {
+    console.log('✅ Dist folder found. Serving static files.');
+    app.use(express.static(distPath));
+  } else {
+    console.error('❌ CRITICAL ERROR: Dist folder NOT found! Run "npm run build" before starting the server.');
+  }
+} else {
+  console.log('🚀 Running in DEVELOPMENT mode.');
+}
+
 // MongoDB Connection
-// Connecting to 'findmypuppy' cluster, 'findmypuppy' database, 'user' collection
-const MONGO_URI = "mongodb+srv://vimaurya24_db_user:jrPF6GqaTX9H40s1@findmypuppy.q6hlrak.mongodb.net/findmypuppy?appName=findmypuppy";
-const COLLECTION_NAME = "user"; // As requested
+const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://vimaurya24_db_user:jrPF6GqaTX9H40s1@findmypuppy.q6hlrak.mongodb.net/findmypuppy?appName=findmypuppy";
+const COLLECTION_NAME = "user"; 
 
 mongoose.connect(MONGO_URI)
   .then(() => console.log('✅ Connected to MongoDB Atlas successfully!'))
@@ -109,8 +144,8 @@ const initializePriceOffer = async () => {
 mongoose.connection.once('open', async () => {
   initializePriceOffer();
   
-   // Migration: Ensure all existing users have the 'referredBy' field
-   try {
+  // Migration: Ensure all existing users have the 'referredBy' field
+  try {
     // 1. Add referredBy only where it is missing, null, or empty
     const result = await User.updateMany(
       {
@@ -124,7 +159,7 @@ mongoose.connection.once('open', async () => {
         $set: { referredBy: "" }
       }
     );
-    
+
     if (result.modifiedCount > 0) {
       console.log(
         `✅ Database Migration: Updated 'referredBy' for ${result.modifiedCount} users`
@@ -218,7 +253,10 @@ app.post('/api/signup', async (req, res) => {
         console.log(`- Extracted Referrer Username: "${extractedUsername}"`);
         console.log(`- Current Year suffix: "${codeToUse.slice(-4)}"`);
         
-        referrerUser = await User.findOne({ username: extractedUsername });
+        // Case-insensitive search for referrer to be robust
+        referrerUser = await User.findOne({ 
+          username: { $regex: new RegExp(`^${extractedUsername}$`, 'i') } 
+        });
         
         if (referrerUser) {
           finalReferredByCode = codeToUse; // Store the exact code used during signup
@@ -487,7 +525,88 @@ app.post('/api/user/update-level-passed', async (req, res) => {
   }
 });
 
-// Create Purchase History Endpoint
+// --- RAZORPAY ENDPOINTS ---
+
+// Create Razorpay Order
+app.post('/api/razorpay/create-order', async (req, res) => {
+  try {
+    const { amount, currency = 'INR', receipt } = req.body;
+
+    if (!amount) {
+      return res.status(400).json({ success: false, message: "Amount is required." });
+    }
+
+    const options = {
+      amount: Math.round(amount * 100), // Amount in smallest currency unit (paise)
+      currency,
+      receipt,
+    };
+
+    const order = await razorpay.orders.create(options);
+    res.status(200).json({ success: true, order });
+  } catch (error) {
+    console.error('Razorpay Order Error:', error);
+    res.status(500).json({ success: false, message: "Failed to create Razorpay order." });
+  }
+});
+
+// Verify Razorpay Payment
+app.post('/api/razorpay/verify-payment', async (req, res) => {
+  try {
+    const { 
+      razorpay_order_id, 
+      razorpay_payment_id, 
+      razorpay_signature,
+      username,
+      pack,
+      hintsToAdd
+    } = req.body;
+
+    const body = razorpay_order_id + "|" + razorpay_payment_id;
+    const expectedSignature = crypto
+      .createHmac('sha256', RAZORPAY_KEY_SECRET)
+      .update(body.toString())
+      .digest('hex');
+
+    const isSignatureValid = expectedSignature === razorpay_signature;
+
+    if (isSignatureValid) {
+      // Payment is successful, update user hints and record purchase
+      const user = await User.findOne({ username });
+      if (!user) {
+        return res.status(404).json({ success: false, message: "User not found." });
+      }
+
+      // Update hints
+      user.hints = (user.hints || 0) + hintsToAdd;
+      await user.save();
+
+      // Record purchase history
+      const purchase = new PurchaseHistory({
+        username,
+        purchaseId: razorpay_payment_id,
+        amount: req.body.amount || 0,
+        purchaseType: 'Hints',
+        pack,
+        purchaseMode: 'Money'
+      });
+      await purchase.save();
+
+      res.status(200).json({ 
+        success: true, 
+        message: "Payment verified and hints added.",
+        hints: user.hints
+      });
+    } else {
+      res.status(400).json({ success: false, message: "Invalid payment signature." });
+    }
+  } catch (error) {
+    console.error('Razorpay Verification Error:', error);
+    res.status(500).json({ success: false, message: "Failed to verify payment." });
+  }
+});
+
+// Create Purchase History Endpoint (Manual/Legacy)
 app.post('/api/purchase-history', async (req, res) => {
   try {
     const { username, amount, purchaseType, pack, purchaseMode, currentUser } = req.body;
@@ -553,13 +672,13 @@ app.post('/api/purchase-history', async (req, res) => {
       },
       {
         $setOnInsert: {
-          username,
-          purchaseId,
-          amount,
-          purchaseType,
-          pack,
+      username,
+      purchaseId,
+      amount,
+      purchaseType,
+      pack,
           purchaseMode: safePurchaseMode,
-          purchaseDate: new Date()
+      purchaseDate: new Date()
         }
       },
       {
@@ -606,7 +725,11 @@ app.get('/api/purchase-history/:username', async (req, res) => {
     //   });
     // }
 
-    const purchases = await PurchaseHistory.find({ username })
+    // Only fetch purchases where mode is Money or Referral (exclude Points)
+    const purchases = await PurchaseHistory.find({ 
+      username,
+      purchaseMode: { $in: ['Money', 'Referral'] }
+    })
       .sort({ purchaseDate: -1 }) // Most recent first
       .exec();
 
@@ -768,15 +891,36 @@ app.post('/api/price-offer/migrate', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Backend Server running on http://localhost:${PORT}`);
+  console.log(`🚀 Backend Server running on http://localhost:${PORT} (${isProduction ? 'PRODUCTION' : 'DEVELOPMENT'})`);
   
-  // Start the frontend dev server
-  console.log('📦 Starting frontend dev server...');
-  const viteProcess = spawn('npm', ['run', 'dev'], {
-    cwd: __dirname,
-    stdio: 'inherit',
-    shell: true
-  });
+  if (isProduction) {
+    // In production, for any request that doesn't match a static file or API route,
+    // serve index.html to support client-side routing (SPA)
+    app.get('*', (req, res) => {
+      // 1. Never serve HTML for API calls
+      if (req.path.startsWith('/api/')) return res.status(404).json({ error: 'API endpoint not found' });
+      
+      // 2. Never serve HTML for missing static assets (fixes MIME error)
+      if (req.path.match(/\.(js|css|png|jpg|jpeg|gif|ico|svg|webmanifest)$/)) {
+        return res.status(404).send('Asset not found');
+      }
+
+      // 3. Serve index.html for everything else (SPA routing)
+      const indexPath = join(distPath, 'index.html');
+      if (fs.existsSync(indexPath)) {
+        res.sendFile(indexPath);
+      } else {
+        res.status(404).send('Application not built. Please run "npm run build".');
+      }
+    });
+  } else {
+    // Start the frontend dev server ONLY in development
+    console.log('📦 Starting frontend dev server...');
+    const viteProcess = spawn('npm', ['run', 'dev'], {
+      cwd: __dirname,
+      stdio: 'inherit',
+      shell: true
+    });
   
   viteProcess.on('error', (error) => {
     console.error('❌ Failed to start frontend dev server:', error);
@@ -800,4 +944,5 @@ app.listen(PORT, () => {
     viteProcess.kill();
     process.exit(0);
   });
+  }
 });
