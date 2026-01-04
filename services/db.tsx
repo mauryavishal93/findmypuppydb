@@ -257,5 +257,26 @@ export const db = {
       console.error("DB Get Price Offer Error:", error);
       return { success: false, message: "Connection error." };
     }
+  },
+
+  signInWithGoogle: async (idToken: string, referralCode?: string): Promise<AuthResponse> => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/auth/google/signin`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ idToken, referralCode }),
+      });
+
+      const data = await response.json();
+      if (!response.ok) {
+        return { success: false, message: data.message || "Google sign in failed" };
+      }
+      return data;
+    } catch (error) {
+      console.error("DB Google Sign In Error:", error);
+      return { success: false, message: "Connection error. Check your internet." };
+    }
   }
 };

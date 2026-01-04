@@ -9,6 +9,7 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import Razorpay from 'razorpay';
 import crypto from 'crypto';
+import fs from 'fs';
 import { OAuth2Client } from 'google-auth-library';
 
 // Load environment variables from .env file
@@ -47,10 +48,24 @@ app.use(cors());
 app.use(express.json());
 
 // Serve static files from the 'dist' directory in production
-const isProduction = process.env.NODE_ENV === 'production';
+const isProduction = process.env.NODE_ENV === 'production' || process.env.RENDER === 'true';
+const distPath = join(__dirname, '..', 'dist');
+
+console.log('--- Deployment Diagnostics ---');
+console.log(`Node version: ${process.version}`);
+console.log(`Current Dir: ${__dirname}`);
+console.log(`Target Dist Path: ${distPath}`);
+console.log(`Environment: ${process.env.NODE_ENV}`);
+
 if (isProduction) {
-  const distPath = join(__dirname, 'dist');
-  app.use(express.static(distPath));
+  if (fs.existsSync(distPath)) {
+    console.log('✅ Dist folder found. Serving static files.');
+    app.use(express.static(distPath));
+  } else {
+    console.error('❌ CRITICAL ERROR: Dist folder NOT found! Run "npm run build" before starting the server.');
+  }
+} else {
+  console.log('🚀 Running in DEVELOPMENT mode.');
 }
 
 // MongoDB Connection
@@ -148,24 +163,30 @@ mongoose.connection.once('open', async () => {
   
   // Migration: Ensure all existing users have the 'referredBy' field
   try {
-    // 1. Add field if missing
-    await User.updateMany(
-      { referredBy: { $exists: false } },
-      { $set: { referredBy: "" } }
-    );
-    
-    // 2. Convert empty strings to null for better clarity
+    // 1. Add referredBy only where it is missing, null, or empty
     const result = await User.updateMany(
-      { referredBy: null },
-      { $set: { referredBy: "" } }
+      {
+        $or: [
+          { referredBy: { $exists: false } },
+          { referredBy: null },
+          { referredBy: "" }
+        ]
+      },
+      {
+        $set: { referredBy: "" }
+      }
     );
-    
+
     if (result.modifiedCount > 0) {
-      console.log(`✅ Database Migration: Cleaned up 'referredBy' field for ${result.modifiedCount} users.`);
+      console.log(
+        `✅ Database Migration: Updated 'referredBy' for ${result.modifiedCount} users`
+      );
+    } else {
+      console.log("ℹ️ No records needed migration");
     }
   } catch (error) {
-    console.error('⚠️ Migration Error:', error);
-  }
+    console.error("⚠️ Migration Error:", error);
+  }  
 });
 
 // --- ROUTES ---
@@ -262,7 +283,10 @@ app.post('/api/signup', async (req, res) => {
         console.log(`- Extracted Referrer Username: "${extractedUsername}"`);
         console.log(`- Current Year suffix: "${codeToUse.slice(-4)}"`);
         
-        referrerUser = await User.findOne({ username: extractedUsername });
+        // Case-insensitive search for referrer to be robust
+        referrerUser = await User.findOne({ 
+          username: { $regex: new RegExp(`^${extractedUsername}$`, 'i') } 
+        });
         
         if (referrerUser) {
           finalReferredByCode = codeToUse; // Store the exact code used during signup
@@ -1056,18 +1080,30 @@ app.listen(PORT, () => {
     // In production, for any request that doesn't match a static file or API route,
     // serve index.html to support client-side routing (SPA)
     app.get('*', (req, res) => {
-      // Don't intercept API calls that might have reached here due to errors
+      // 1. Never serve HTML for API calls
       if (req.path.startsWith('/api/')) return res.status(404).json({ error: 'API endpoint not found' });
-      res.sendFile(join(__dirname, 'dist', 'index.html'));
+      
+      // 2. Never serve HTML for missing static assets (fixes MIME error)
+      if (req.path.match(/\.(js|css|png|jpg|jpeg|gif|ico|svg|webmanifest)$/)) {
+        return res.status(404).send('Asset not found');
+      }
+
+      // 3. Serve index.html for everything else (SPA routing)
+      const indexPath = join(distPath, 'index.html');
+      if (fs.existsSync(indexPath)) {
+        res.sendFile(indexPath);
+      } else {
+        res.status(404).send('Application not built. Please run "npm run build".');
+      }
     });
   } else {
     // Start the frontend dev server ONLY in development
-  console.log('📦 Starting frontend dev server...');
-  const viteProcess = spawn('npm', ['run', 'dev'], {
-    cwd: __dirname,
-    stdio: 'inherit',
-    shell: true
-  });
+    console.log('📦 Starting frontend dev server...');
+    const viteProcess = spawn('npm', ['run', 'dev'], {
+      cwd: join(__dirname, '..'),
+      stdio: 'inherit',
+      shell: true
+    });
   
   viteProcess.on('error', (error) => {
     console.error('❌ Failed to start frontend dev server:', error);
