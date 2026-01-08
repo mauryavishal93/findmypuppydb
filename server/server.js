@@ -11,16 +11,19 @@ import Razorpay from 'razorpay';
 import crypto from 'crypto';
 import fs from 'fs';
 import { OAuth2Client } from 'google-auth-library';
+import nodemailer from 'nodemailer';
 
-// Load environment variables from .env file
-dotenv.config();
-
+// Load environment variables from .env file (look in parent directory since server.js is in server folder)
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
+dotenv.config({ path: join(__dirname, '..', '.env') });
+
+// Also try loading from current directory as fallback
+dotenv.config();
 
 const app = express();
 // Professional SRE Rule: Always allow the environment to override the PORT
-const PORT = process.env.PORT || 5274;
+const PORT = process.env.PORT || 5774;
 
 // Razorpay Configuration (Use Environment Variables for Production)
 const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID || 'rzp_test_RyzZQD56IABhEH';
@@ -90,6 +93,8 @@ const userSchema = new mongoose.Schema({
   levelPassedMedium: { type: Number, default: 0 }, // Number of levels passed in Medium difficulty
   levelPassedHard: { type: Number, default: 0 }, // Number of levels passed in Hard difficulty
   referredBy: { type: String, default: "" }, // Referral code used during signup (empty string instead of null)
+  resetPasswordToken: { type: String, default: null }, // Password reset token
+  resetPasswordExpires: { type: Date, default: null }, // Token expiration date
   createdAt: { type: Date, default: Date.now },
   lastLogin: { type: Date, default: Date.now }
 }, { collection: COLLECTION_NAME });
@@ -396,6 +401,371 @@ app.post('/api/signup', async (req, res) => {
       return res.status(409).json({ success: false, message: "Username or Email already exists." });
     }
     res.status(500).json({ success: false, message: "Server error during signup." });
+  }
+});
+
+// Email Configuration for Password Reset (moved up for better organization)
+const createTransporter = () => {
+  // Use environment variables for email configuration
+  // For Gmail: Use App Password (not regular password)
+  // Important: Trim whitespace from credentials as they often have trailing spaces
+  const smtpUser = (process.env.SMTP_USER || process.env.EMAIL_USER || '').trim();
+  const smtpPass = (process.env.SMTP_PASS || process.env.EMAIL_PASS || '').trim();
+  
+  // Get SMTP settings
+  const smtpHost = (process.env.SMTP_HOST || 'smtp.gmail.com').trim();
+  const smtpPort = parseInt(process.env.SMTP_PORT || '587');
+  const smtpSecure = process.env.SMTP_SECURE === 'true'; // true for 465, false for other ports
+
+  // Only create transporter if credentials are provided
+  if (smtpUser && smtpPass) {
+    // Gmail App Password configuration
+    // For port 587: use secure: false, STARTTLS will be used automatically
+    // For port 465: use secure: true for SSL
+    const emailConfig = {
+      host: smtpHost,
+      port: smtpPort,
+      secure: smtpSecure, // false for 587 (STARTTLS), true for 465 (SSL)
+      auth: {
+        user: smtpUser,
+        pass: smtpPass
+      },
+      // Gmail App Passwords: Standard configuration
+      tls: {
+        rejectUnauthorized: false // Allow self-signed certificates (useful for development)
+      }
+    };
+
+    // Debug: Show configuration (mask password)
+    const maskedPass = smtpPass.length > 4 
+      ? smtpPass.substring(0, 2) + '****' + smtpPass.substring(smtpPass.length - 2)
+      : '****';
+    console.log('📧 Email Configuration:');
+    console.log(`   Host: ${smtpHost}`);
+    console.log(`   Port: ${smtpPort}`);
+    console.log(`   Secure: ${smtpSecure}`);
+    console.log(`   User: ${smtpUser}`);
+    console.log(`   Pass: ${maskedPass}`);
+
+    const transporter = nodemailer.createTransport(emailConfig);
+    
+    // Verify transporter connection on startup
+    transporter.verify((error, success) => {
+      if (error) {
+        console.error('❌ Email service verification failed:');
+        console.error(`   Error: ${error.message}`);
+        if (error.responseCode === 535 || error.responseCode === '535') {
+          console.error('   🔐 Authentication Error:');
+          console.error('      - Make sure you are using an App Password (not your regular Gmail password)');
+          console.error('      - Ensure 2-Factor Authentication is enabled on your Google account');
+          console.error('      - Generate a new App Password at: https://myaccount.google.com/apppasswords');
+          console.error('      - Check that SMTP_USER and SMTP_PASS environment variables are set correctly');
+          console.error('      - Verify the password has no extra spaces (it should be trimmed automatically)');
+        } else {
+          console.error('   Please check your SMTP credentials in environment variables.');
+        }
+        if (error.command) {
+          console.error(`   Command: ${error.command}`);
+        }
+        if (error.response) {
+          console.error(`   Response: ${error.response}`);
+        }
+      } else {
+        console.log('✅ Email service verified and ready');
+        console.log(`   SMTP Host: ${smtpHost}:${smtpPort}`);
+        console.log(`   From Email: ${smtpUser}`);
+      }
+    });
+    
+    return transporter;
+  }
+  return null;
+};
+
+const emailTransporter = createTransporter();
+if (emailTransporter) {
+  console.log('📧 Email service configured for password reset');
+} else {
+  console.warn('⚠️ Email service not configured. Set SMTP_USER and SMTP_PASS environment variables for password reset functionality.');
+  console.warn('   Example: SMTP_USER=your-email@gmail.com SMTP_PASS=your-app-password');
+}
+
+// Password Reset Request Endpoint
+app.post('/api/auth/forgot-password', async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ success: false, message: "Email is required." });
+    }
+
+    // Find user by email
+    const user = await User.findOne({ email: email.toLowerCase() });
+    
+    // Always return success message (security best practice - don't reveal if email exists)
+    if (!user) {
+      return res.status(200).json({ 
+        success: true, 
+        message: "If an account with that email exists, a password reset link has been sent." 
+      });
+    }
+
+    // Check if user has local auth (not OAuth only)
+    if (user.authProvider === 'google' && !user.password) {
+      return res.status(200).json({ 
+        success: true, 
+        message: "If an account with that email exists, a password reset link has been sent." 
+      });
+    }
+
+    // Generate reset token
+    const resetToken = crypto.randomBytes(32).toString('hex');
+    const resetTokenExpiry = new Date();
+    resetTokenExpiry.setHours(resetTokenExpiry.getHours() + 1); // Token expires in 1 hour
+
+    // Save token to user
+    user.resetPasswordToken = resetToken;
+    user.resetPasswordExpires = resetTokenExpiry;
+    await user.save();
+
+    // Create reset URL
+    const resetUrl = `${process.env.FRONTEND_URL || 'http://findmypuppy.onrender.com'}/reset-password?token=${resetToken}`;
+
+    // Send email if transporter is configured
+    if (emailTransporter) {
+      const fromEmail = process.env.SMTP_USER || process.env.EMAIL_USER;
+      const mailOptions = {
+        from: `"Find My Puppy 🐾" <${fromEmail}>`,
+        to: user.email,
+        subject: '🔐 Let\'s Reset Your Password - Find My Puppy',
+        html: `
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          </head>
+          <body style="margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f5f7fa;">
+            <div style="max-width: 600px; margin: 40px auto; background-color: #ffffff; border-radius: 16px; overflow: hidden; box-shadow: 0 10px 40px rgba(0,0,0,0.1);">
+              
+              <!-- Header with Gradient -->
+              <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 40px 30px; text-align: center; position: relative; overflow: hidden;">
+                <div style="position: absolute; top: -50px; right: -50px; width: 200px; height: 200px; background: rgba(255,255,255,0.1); border-radius: 50%;"></div>
+                <div style="position: absolute; bottom: -80px; left: -80px; width: 250px; height: 250px; background: rgba(255,255,255,0.08); border-radius: 50%;"></div>
+                <h1 style="color: white; margin: 0; font-size: 32px; font-weight: bold; position: relative; z-index: 1;">
+                  🐾 Find My Puppy
+                </h1>
+                <p style="color: rgba(255,255,255,0.9); margin: 10px 0 0 0; font-size: 16px; position: relative; z-index: 1;">
+                  Where Fun Meets Adventure!
+                </p>
+              </div>
+
+              <!-- Main Content -->
+              <div style="padding: 40px 30px;">
+                <div style="text-align: center; margin-bottom: 30px;">
+                  <div style="font-size: 60px; margin-bottom: 10px;">🔐</div>
+                  <h2 style="color: #333; margin: 0; font-size: 28px; font-weight: 600;">
+                    Password Reset Request
+                  </h2>
+                </div>
+
+                <p style="color: #555; line-height: 1.8; font-size: 16px; margin-bottom: 20px;">
+                  Hey there, <strong style="color: #667eea;">${user.username}</strong>! 👋
+                </p>
+
+                <p style="color: #555; line-height: 1.8; font-size: 16px; margin-bottom: 20px;">
+                  Looks like you've forgotten your password - no worries, it happens to the best of us! 🐶 We're here to help you get back into your Find My Puppy account so you can continue your fun adventures.
+                </p>
+
+                <div style="background: linear-gradient(135deg, #f8f9ff 0%, #fff5ff 100%); border-left: 4px solid #667eea; padding: 20px; border-radius: 8px; margin: 30px 0;">
+                  <p style="color: #555; line-height: 1.8; font-size: 15px; margin: 0;">
+                    <strong style="color: #667eea;">📝 Quick Steps:</strong><br>
+                    1. Click the big button below<br>
+                    2. Create a new secure password<br>
+                    3. Get back to finding those adorable puppies! 🎉
+                  </p>
+                </div>
+
+                <!-- Reset Button -->
+                <div style="text-align: center; margin: 40px 0;">
+                  <a href="${resetUrl}" 
+                     style="display: inline-block; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 18px 50px; text-decoration: none; border-radius: 12px; font-weight: bold; font-size: 18px; box-shadow: 0 8px 20px rgba(102, 126, 234, 0.4); transition: transform 0.2s; letter-spacing: 0.5px;">
+                    🔑 Reset My Password
+                  </a>
+                </div>
+
+                <!-- Alternative Link Section -->
+                <div style="background-color: #f8f9fa; padding: 20px; border-radius: 8px; margin: 30px 0;">
+                  <p style="color: #666; line-height: 1.6; font-size: 14px; margin: 0 0 12px 0; text-align: center;">
+                    <strong>📎 Or copy and paste this link into your browser:</strong>
+                  </p>
+                  <p style="color: #667eea; word-break: break-all; font-size: 13px; background: white; padding: 12px; border-radius: 6px; border: 1px solid #e0e0e0; margin: 0; font-family: 'Courier New', monospace;">
+                    ${resetUrl}
+                  </p>
+                </div>
+
+                <!-- Important Notice -->
+                <div style="background: #fff8e1; border: 2px solid #ffc107; border-radius: 8px; padding: 20px; margin: 30px 0;">
+                  <p style="color: #856404; line-height: 1.7; font-size: 14px; margin: 0 0 10px 0;">
+                    <strong style="font-size: 16px;">⏰ Important Reminders:</strong>
+                  </p>
+                  <ul style="color: #856404; line-height: 1.8; font-size: 14px; margin: 0; padding-left: 20px;">
+                    <li>This link will <strong>expire in 1 hour</strong> for your security</li>
+                    <li>If you <strong>didn't request</strong> this password reset, just ignore this email - your account is safe! 🛡️</li>
+                    <li>Never share this link with anyone - we'll never ask for it!</li>
+                  </ul>
+                </div>
+
+                <!-- Help Section -->
+                <div style="text-align: center; margin-top: 30px; padding-top: 30px; border-top: 1px solid #e0e0e0;">
+                  <p style="color: #888; font-size: 14px; line-height: 1.6; margin: 0 0 10px 0;">
+                    Having trouble clicking the button? 🤔
+                  </p>
+                  <p style="color: #888; font-size: 14px; line-height: 1.6; margin: 0;">
+                    Simply copy the link above and paste it into your web browser's address bar.
+                  </p>
+                </div>
+
+                <!-- Fun Footer Message -->
+                <div style="text-align: center; margin-top: 30px; padding: 20px; background: linear-gradient(135deg, #f8f9ff 0%, #fff5ff 100%); border-radius: 8px;">
+                  <p style="color: #667eea; font-size: 15px; font-weight: 600; margin: 0;">
+                    🐕 Happy Puppy Hunting! 🐕
+                  </p>
+                  <p style="color: #888; font-size: 13px; margin: 8px 0 0 0;">
+                    We can't wait to see you back in the game!
+                  </p>
+                </div>
+              </div>
+
+              <!-- Footer -->
+              <div style="background-color: #f8f9fa; padding: 25px 30px; text-align: center; border-top: 1px solid #e0e0e0;">
+                <p style="color: #999; font-size: 12px; margin: 0 0 8px 0; line-height: 1.6;">
+                  This email was sent to <strong style="color: #666;">${user.email}</strong>
+                </p>
+                <p style="color: #999; font-size: 12px; margin: 0;">
+                  © ${new Date().getFullYear()} MVTechnology. All rights reserved.
+                </p>
+                <p style="color: #bbb; font-size: 11px; margin: 12px 0 0 0;">
+                  Find My Puppy | Where Adventure Meets Fun 🎮
+                </p>
+              </div>
+            </div>
+          </body>
+          </html>
+        `,
+        text: `
+🔐 Password Reset Request - Find My Puppy
+
+Hey there, ${user.username}! 👋
+
+Looks like you've forgotten your password - no worries, it happens to the best of us! 🐶 We're here to help you get back into your Find My Puppy account so you can continue your fun adventures.
+
+📝 Quick Steps:
+1. Click the link below
+2. Create a new secure password
+3. Get back to finding those adorable puppies! 🎉
+
+🔑 Reset Your Password:
+${resetUrl}
+
+⏰ Important Reminders:
+- This link will expire in 1 hour for your security
+- If you didn't request this password reset, just ignore this email - your account is safe! 🛡️
+- Never share this link with anyone - we'll never ask for it!
+
+Having trouble? Simply copy the link above and paste it into your web browser's address bar.
+
+🐕 Happy Puppy Hunting! 🐕
+We can't wait to see you back in the game!
+
+---
+This email was sent to ${user.email}
+© ${new Date().getFullYear()} MVTechnology. All rights reserved.
+Find My Puppy | Where Adventure Meets Fun 🎮
+        `
+      };
+
+      try {
+        console.log(`📤 Attempting to send password reset email to ${user.email}...`);
+        const info = await emailTransporter.sendMail(mailOptions);
+        console.log(`✅ Password reset email sent successfully!`);
+        console.log(`   Message ID: ${info.messageId}`);
+        console.log(`   To: ${user.email}`);
+        console.log(`   From: ${fromEmail}`);
+        console.log(`   Response: ${info.response || 'Email accepted by server'}`);
+      } catch (emailError) {
+        console.error('❌ ERROR: Failed to send password reset email');
+        console.error(`   To: ${user.email}`);
+        console.error(`   Error Code: ${emailError.code || 'UNKNOWN'}`);
+        console.error(`   Error Message: ${emailError.message || emailError.toString()}`);
+        if (emailError.response) {
+          console.error(`   SMTP Response: ${emailError.response}`);
+        }
+        if (emailError.responseCode) {
+          console.error(`   SMTP Response Code: ${emailError.responseCode}`);
+        }
+        // Log the reset URL as fallback
+        console.log(`🔗 Fallback: Password reset link for ${user.email}: ${resetUrl}`);
+        // Still return success to user (don't reveal email service issues)
+      }
+    } else {
+      // If email service not configured, log the reset URL for development
+      console.warn(`⚠️ Email service not configured. Password reset link for ${user.email}:`);
+      console.log(`🔗 ${resetUrl}`);
+    }
+
+    res.status(200).json({ 
+      success: true, 
+      message: "If an account with that email exists, a password reset link has been sent." 
+    });
+  } catch (error) {
+    console.error('Forgot Password Error:', error);
+    res.status(500).json({ success: false, message: "Server error processing password reset request." });
+  }
+});
+
+// Password Reset Endpoint
+app.post('/api/auth/reset-password', async (req, res) => {
+  try {
+    const { token, newPassword } = req.body;
+
+    if (!token || !newPassword) {
+      return res.status(400).json({ success: false, message: "Token and new password are required." });
+    }
+
+    if (newPassword.length < 6) {
+      return res.status(400).json({ success: false, message: "Password must be at least 6 characters long." });
+    }
+
+    // Find user with valid reset token
+    const user = await User.findOne({
+      resetPasswordToken: token,
+      resetPasswordExpires: { $gt: Date.now() } // Token not expired
+    });
+
+    if (!user) {
+      return res.status(400).json({ success: false, message: "Invalid or expired reset token." });
+    }
+
+    // Hash new password
+    const saltRounds = 10;
+    const hashedPassword = await bcrypt.hash(newPassword, saltRounds);
+
+    // Update password and clear reset token
+    user.password = hashedPassword;
+    user.resetPasswordToken = null;
+    user.resetPasswordExpires = null;
+    await user.save();
+
+    console.log(`✅ Password reset successful for user: ${user.username}`);
+
+    res.status(200).json({ 
+      success: true, 
+      message: "Password has been reset successfully. You can now login with your new password." 
+    });
+  } catch (error) {
+    console.error('Reset Password Error:', error);
+    res.status(500).json({ success: false, message: "Server error resetting password." });
   }
 });
 
@@ -1073,6 +1443,96 @@ app.post('/api/price-offer/migrate', async (req, res) => {
   }
 });
 
+// Email Test Endpoint (for diagnostics - remove in production or add auth)
+app.post('/api/auth/test-email', async (req, res) => {
+  try {
+    const { testEmail } = req.body;
+    
+    if (!emailTransporter) {
+      return res.status(503).json({ 
+        success: false, 
+        message: "Email service not configured. Set SMTP_USER and SMTP_PASS environment variables.",
+        configured: false
+      });
+    }
+
+    const fromEmail = process.env.SMTP_USER || process.env.EMAIL_USER;
+    const toEmail = testEmail || fromEmail;
+
+    const testMailOptions = {
+      from: `"Find My Puppy Test" <${fromEmail}>`,
+      to: toEmail,
+      subject: 'Test Email - Find My Puppy Email Service',
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+          <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 30px; text-align: center; border-radius: 10px 10px 0 0;">
+            <h1 style="color: white; margin: 0;">🐾 Find My Puppy</h1>
+          </div>
+          <div style="background: #f8f9fa; padding: 30px; border-radius: 0 0 10px 10px;">
+            <h2 style="color: #333; margin-top: 0;">Email Service Test</h2>
+            <p style="color: #666; line-height: 1.6;">
+              This is a test email to verify that the email service is working correctly.
+            </p>
+            <p style="color: #666; line-height: 1.6;">
+              If you received this email, the email configuration is correct! ✅
+            </p>
+            <p style="color: #999; font-size: 12px; margin-top: 30px; padding-top: 20px; border-top: 1px solid #ddd;">
+              Sent at: ${new Date().toLocaleString()}
+            </p>
+          </div>
+        </div>
+      `,
+      text: `Test Email - Find My Puppy Email Service\n\nThis is a test email to verify that the email service is working correctly.\n\nSent at: ${new Date().toLocaleString()}`
+    };
+
+    const info = await emailTransporter.sendMail(testMailOptions);
+    
+    res.status(200).json({ 
+      success: true, 
+      message: `Test email sent successfully to ${toEmail}`,
+      messageId: info.messageId,
+      response: info.response,
+      configured: true
+    });
+  } catch (error) {
+    console.error('Test Email Error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: "Failed to send test email",
+      error: error.message,
+      code: error.code,
+      configured: emailTransporter !== null
+    });
+  }
+});
+
+// Email Configuration Status Endpoint
+app.get('/api/auth/email-status', (req, res) => {
+  const isConfigured = emailTransporter !== null;
+  const hasUser = !!(process.env.SMTP_USER || process.env.EMAIL_USER);
+  const hasPass = !!(process.env.SMTP_PASS || process.env.EMAIL_PASS);
+  
+  res.status(200).json({
+    configured: isConfigured,
+    hasCredentials: hasUser && hasPass,
+    smtpHost: process.env.SMTP_HOST || 'smtp.gmail.com',
+    smtpPort: process.env.SMTP_PORT || '587',
+    fromEmail: process.env.SMTP_USER || process.env.EMAIL_USER || 'Not set',
+    message: isConfigured 
+      ? 'Email service is configured and ready'
+      : 'Email service is not configured. Set SMTP_USER and SMTP_PASS environment variables.'
+  });
+});
+
+// Serve privacy policy page (accessible in both dev and production)
+app.get('/privacy-policy.html', (req, res) => {
+  if (isProduction) {
+    res.sendFile(join(__dirname, '..', 'dist', 'privacy-policy.html'));
+  } else {
+    res.sendFile(join(__dirname, '..', 'public', 'privacy-policy.html'));
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`🚀 Backend Server running on http://localhost:${PORT} (${isProduction ? 'PRODUCTION' : 'DEVELOPMENT'})`);
   
@@ -1096,7 +1556,7 @@ app.listen(PORT, () => {
         res.status(404).send('Application not built. Please run "npm run build".');
       }
     });
-  } else if (process.env.SKIP_VITE !== 'true') {
+  } else {
     // Start the frontend dev server ONLY in development
     console.log('📦 Starting frontend dev server...');
     const viteProcess = spawn('npm', ['run', 'dev'], {
@@ -1118,13 +1578,13 @@ app.listen(PORT, () => {
   // Handle graceful shutdown
   process.on('SIGINT', () => {
     console.log('\n🛑 Shutting down servers...');
-    if (typeof viteProcess !== 'undefined') viteProcess.kill();
+    viteProcess.kill();
     process.exit(0);
   });
   
   process.on('SIGTERM', () => {
     console.log('\n🛑 Shutting down servers...');
-    if (typeof viteProcess !== 'undefined') viteProcess.kill();
+    viteProcess.kill();
     process.exit(0);
   });
   }
