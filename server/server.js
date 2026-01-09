@@ -200,7 +200,37 @@ mongoose.connection.once('open', async () => {
 // --- ROUTES ---
 
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', message: 'Server is running' });
+  const dbStatus = mongoose.connection.readyState;
+  const dbStatusText = {
+    0: 'disconnected',
+    1: 'connected',
+    2: 'connecting',
+    3: 'disconnecting'
+  }[dbStatus] || 'unknown';
+  
+  const emailConfigured = emailTransporter !== null;
+  const smtpUser = (process.env.SMTP_USER || process.env.EMAIL_USER || '').trim();
+  const smtpPass = (process.env.SMTP_PASS || process.env.EMAIL_PASS || '').trim();
+  
+  res.json({ 
+    status: dbStatus === 1 ? 'ok' : 'degraded',
+    message: 'Server is running',
+    database: {
+      status: dbStatusText,
+      readyState: dbStatus,
+      connected: dbStatus === 1
+    },
+    email: {
+      configured: emailConfigured,
+      hasCredentials: !!smtpUser && !!smtpPass,
+      transporterAvailable: emailConfigured
+    },
+    environment: {
+      nodeEnv: process.env.NODE_ENV || 'development',
+      isRender: !!process.env.RENDER,
+      port: process.env.PORT || 5774
+    }
+  });
 });
 
 // Login Endpoint
@@ -514,10 +544,31 @@ app.post('/api/auth/forgot-password', async (req, res) => {
 
     // Log request for debugging (especially in production)
     if (process.env.RENDER || process.env.NODE_ENV === 'production') {
-      console.log(`[FORGOT-PASSWORD] Request received for email: ${email}`);
+      console.log(`\n[FORGOT-PASSWORD] ========== REQUEST RECEIVED ==========`);
+      console.log(`[FORGOT-PASSWORD] Email: ${email || 'not provided'}`);
       console.log(`[FORGOT-PASSWORD] Email transporter available: ${emailTransporter !== null}`);
       console.log(`[FORGOT-PASSWORD] Environment: ${process.env.NODE_ENV || 'development'}`);
       console.log(`[FORGOT-PASSWORD] Render: ${process.env.RENDER ? 'true' : 'false'}`);
+    }
+
+    // Check database connection
+    if (mongoose.connection.readyState !== 1) {
+      console.error('[FORGOT-PASSWORD] Database not connected');
+      console.error(`   Connection state: ${mongoose.connection.readyState}`);
+      console.error('   0 = disconnected, 1 = connected, 2 = connecting, 3 = disconnecting');
+      return res.status(503).json({ 
+        success: false, 
+        message: "Database service is temporarily unavailable. Please try again later." 
+      });
+    }
+
+    // Verify User model is available
+    if (!User || typeof User.findOne !== 'function') {
+      console.error('[FORGOT-PASSWORD] User model not available');
+      return res.status(500).json({ 
+        success: false, 
+        message: "Server configuration error. Please contact support." 
+      });
     }
 
     if (!email) {
@@ -530,14 +581,22 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     // Optimized database query: Use lean() for faster queries and select only needed fields
     // Index on email field ensures fast lookup (O(log n) instead of O(n))
     const queryStartTime = Date.now();
-    const user = await User.findOne({ email: normalizedEmail })
-      .select('email username authProvider password resetPasswordToken resetPasswordExpires')
-      .lean() // Use lean() for faster queries (returns plain JS object instead of Mongoose document)
-      .maxTimeMS(5000); // Set query timeout to 5 seconds for better performance monitoring
-    
-    const queryTime = Date.now() - queryStartTime;
-    if (queryTime > 100) { // Log slow queries (>100ms)
-      console.log(`[PERFORMANCE] Email lookup took ${queryTime}ms for: ${normalizedEmail}`);
+    let user;
+    try {
+      user = await User.findOne({ email: normalizedEmail })
+        .select('email username authProvider password resetPasswordToken resetPasswordExpires')
+        .lean() // Use lean() for faster queries (returns plain JS object instead of Mongoose document)
+        .maxTimeMS(5000); // Set query timeout to 5 seconds for better performance monitoring
+      
+      const queryTime = Date.now() - queryStartTime;
+      if (queryTime > 100) { // Log slow queries (>100ms)
+        console.log(`[PERFORMANCE] Email lookup took ${queryTime}ms for: ${normalizedEmail}`);
+      }
+    } catch (dbError) {
+      console.error('[FORGOT-PASSWORD] Database query error:');
+      console.error(`   Error: ${dbError.message || dbError.toString()}`);
+      console.error(`   Error Type: ${dbError.constructor.name}`);
+      throw new Error(`Database query failed: ${dbError.message}`);
     }
     
     // Check if email exists in database
@@ -563,17 +622,33 @@ app.post('/api/auth/forgot-password', async (req, res) => {
 
     // Save token to user using findOneAndUpdate for efficiency (atomic operation)
     // This is faster than fetching, modifying, and saving
-    await User.findOneAndUpdate(
-      { email: normalizedEmail },
-      { 
-        resetPasswordToken: resetToken,
-        resetPasswordExpires: resetTokenExpiry
-      },
-      { new: false } // We don't need the updated document
-    );
+    try {
+      const updateResult = await User.findOneAndUpdate(
+        { email: normalizedEmail },
+        { 
+          resetPasswordToken: resetToken,
+          resetPasswordExpires: resetTokenExpiry
+        },
+        { new: false } // We don't need the updated document
+      );
+      
+      if (!updateResult) {
+        console.error(`[FORGOT-PASSWORD] Failed to update user with reset token for: ${normalizedEmail}`);
+        throw new Error('Failed to save reset token to database');
+      }
+      
+      console.log(`[FORGOT-PASSWORD] Reset token saved successfully for: ${normalizedEmail}`);
+    } catch (updateError) {
+      console.error('[FORGOT-PASSWORD] Error saving reset token:');
+      console.error(`   Error: ${updateError.message || updateError.toString()}`);
+      throw new Error(`Failed to save reset token: ${updateError.message}`);
+    }
 
-    // Create reset URL
-    const resetUrl = `${process.env.FRONTEND_URL || 'http://findmypuppy.onrender.com'}/reset-password?token=${resetToken}`;
+    // Create reset URL - use https for production/Render
+    const frontendUrl = process.env.FRONTEND_URL || (process.env.RENDER ? 'https://findmypuppy.onrender.com' : 'http://localhost:5173');
+    const resetUrl = `${frontendUrl}/reset-password?token=${resetToken}`;
+    
+    console.log(`🔗 [FORGOT-PASSWORD] Reset URL generated: ${resetUrl.substring(0, 50)}...`);
 
     // Send email if transporter is configured
     if (!emailTransporter) {
@@ -581,10 +656,13 @@ app.post('/api/auth/forgot-password', async (req, res) => {
       console.error('   This should not happen if environment variables are set correctly');
       console.error('   Check Render logs for email service initialization errors');
       console.log(`🔗 Fallback: Password reset link for ${user.email}: ${resetUrl}`);
-      return res.status(500).json({ 
+      console.log('📤 [FORGOT-PASSWORD] Returning 500 error response to client...');
+      const errorResponse = { 
         success: false, 
         message: "Email service is temporarily unavailable. Please try again later or contact support." 
-      });
+      };
+      console.log('📤 [FORGOT-PASSWORD] Error response:', JSON.stringify(errorResponse));
+      return res.status(500).json(errorResponse);
     }
 
     const fromEmail = (process.env.SMTP_USER || process.env.EMAIL_USER || '').trim();
@@ -759,15 +837,24 @@ Find My Puppy | Where Adventure Meets Fun 🎮
       };
 
       try {
-        console.log(`📤 Attempting to send password reset email to ${user.email}...`);
+        console.log(`📤 [FORGOT-PASSWORD] Attempting to send password reset email to ${user.email}...`);
+        console.log(`   Mail options prepared: from="${fromEmail}", to="${user.email}"`);
+        
+        // Verify transporter is still valid before sending
+        if (!emailTransporter || typeof emailTransporter.sendMail !== 'function') {
+          throw new Error('Email transporter is not properly initialized');
+        }
         
         // Add timeout to prevent hanging
+        const sendStartTime = Date.now();
         const sendPromise = emailTransporter.sendMail(mailOptions);
         const timeoutPromise = new Promise((_, reject) => 
           setTimeout(() => reject(new Error('Email send timeout after 30 seconds')), 30000)
         );
         
         const info = await Promise.race([sendPromise, timeoutPromise]);
+        const sendDuration = Date.now() - sendStartTime;
+        console.log(`   Email send completed in ${sendDuration}ms`);
         
         console.log(`✅ Password reset email sent successfully!`);
         console.log(`   Message ID: ${info.messageId || 'N/A'}`);
@@ -782,12 +869,16 @@ Find My Puppy | Where Adventure Meets Fun 🎮
           console.log(`   [PRODUCTION] Reset URL: ${resetUrl.substring(0, 50)}...`);
         }
       } catch (emailError) {
-        console.error('❌ ERROR: Failed to send password reset email');
+        console.error('\n❌ ========== EMAIL SEND ERROR ==========');
+        console.error(`[FORGOT-PASSWORD] Failed to send password reset email`);
+        console.error(`   Timestamp: ${new Date().toISOString()}`);
         console.error(`   To: ${user.email}`);
         console.error(`   From: ${fromEmail}`);
         console.error(`   Error Type: ${emailError.constructor.name}`);
         console.error(`   Error Code: ${emailError.code || 'UNKNOWN'}`);
         console.error(`   Error Message: ${emailError.message || emailError.toString()}`);
+        console.error(`   Environment: ${process.env.NODE_ENV || 'development'}`);
+        console.error(`   Render: ${process.env.RENDER ? 'true' : 'false'}`);
         
         // Detailed error information
         if (emailError.response) {
@@ -819,12 +910,37 @@ Find My Puppy | Where Adventure Meets Fun 🎮
         // Log the reset URL as fallback for manual testing
         console.error(`🔗 Fallback: Password reset link for ${user.email}:`);
         console.error(`   ${resetUrl}`);
+        console.error('❌ ===========================================\n');
         
-        // Return error to user so they know email failed
-        // This helps with debugging and user experience
+        // Determine user-friendly error message based on error type
+        let userMessage = "Failed to send password reset email. Please try again later or contact support.";
+        let errorType = "UNKNOWN";
+        
+        if (emailError.code === 'EAUTH' || emailError.responseCode === 535) {
+          errorType = "AUTHENTICATION_ERROR";
+          userMessage = "Email service authentication failed. Please contact support.";
+        } else if (emailError.code === 'ETIMEDOUT' || emailError.code === 'ECONNECTION') {
+          errorType = "CONNECTION_ERROR";
+          userMessage = "Unable to connect to email service. Please try again in a few moments.";
+        } else if (emailError.message && emailError.message.includes('timeout')) {
+          errorType = "TIMEOUT_ERROR";
+          userMessage = "Email service timed out. Please try again.";
+        } else if (emailError.code) {
+          errorType = emailError.code;
+        }
+        
+        // Return error to user with helpful information (without exposing sensitive details)
         return res.status(500).json({ 
           success: false, 
-          message: "Failed to send password reset email. Please try again later or contact support." 
+          message: userMessage,
+          errorType: errorType,
+          // Include error code for debugging (safe to expose)
+          errorCode: emailError.code || null,
+          // In development, include more details
+          ...(process.env.NODE_ENV !== 'production' && {
+            errorMessage: emailError.message,
+            smtpResponseCode: emailError.responseCode || null
+          })
         });
       }
 
@@ -834,8 +950,39 @@ Find My Puppy | Where Adventure Meets Fun 🎮
       message: "Password reset link has been sent to your email address." 
     });
   } catch (error) {
-    console.error('Forgot Password Error:', error);
-    res.status(500).json({ success: false, message: "Server error processing password reset request." });
+    console.error('\n❌ ========== FORGOT PASSWORD ENDPOINT ERROR ==========');
+    console.error('[FORGOT-PASSWORD] Unhandled error in forgot-password endpoint');
+    console.error(`   Error Type: ${error.constructor.name}`);
+    console.error(`   Error Message: ${error.message || error.toString()}`);
+    console.error(`   Error Stack: ${error.stack || 'No stack trace available'}`);
+    console.error(`   Timestamp: ${new Date().toISOString()}`);
+    console.error(`   Environment: ${process.env.NODE_ENV || 'development'}`);
+    console.error(`   Render: ${process.env.RENDER ? 'true' : 'false'}`);
+    
+    // Check for specific error types
+    if (error.name === 'MongoError' || error.name === 'MongooseError') {
+      console.error('   🔴 Database Error Detected');
+      console.error('      - Check MongoDB connection');
+      console.error('      - Verify MONGO_URI is set correctly in Render');
+    }
+    
+    if (error.message && error.message.includes('User is not defined')) {
+      console.error('   🔴 Model Error: User model not available');
+      console.error('      - Check if mongoose connection is established');
+      console.error('      - Verify User model is properly defined');
+    }
+    
+    console.error('❌ ===================================================\n');
+    
+    // Return detailed error in development, generic in production
+    res.status(500).json({ 
+      success: false, 
+      message: "Server error processing password reset request.",
+      ...(process.env.NODE_ENV !== 'production' && {
+        error: error.message,
+        errorType: error.constructor.name
+      })
+    });
   }
 });
 
@@ -844,43 +991,91 @@ app.post('/api/auth/reset-password', async (req, res) => {
   try {
     const { token, newPassword } = req.body;
 
+    // Log request for debugging (especially in production)
+    if (process.env.RENDER || process.env.NODE_ENV === 'production') {
+      console.log(`[RESET-PASSWORD] Request received`);
+      console.log(`   Token provided: ${token ? 'Yes' : 'No'} (length: ${token ? token.length : 0})`);
+      console.log(`   Password provided: ${newPassword ? 'Yes' : 'No'} (length: ${newPassword ? newPassword.length : 0})`);
+      console.log(`   Environment: ${process.env.NODE_ENV || 'development'}`);
+      console.log(`   Render: ${process.env.RENDER ? 'true' : 'false'}`);
+    }
+
     if (!token || !newPassword) {
+      console.error('[RESET-PASSWORD] Missing required fields');
       return res.status(400).json({ success: false, message: "Token and new password are required." });
     }
 
     if (newPassword.length < 6) {
+      console.error(`[RESET-PASSWORD] Password too short: ${newPassword.length} characters`);
       return res.status(400).json({ success: false, message: "Password must be at least 6 characters long." });
     }
 
-    // Find user with valid reset token
+    // Find user with valid reset token (optimized query)
+    const queryStartTime = Date.now();
     const user = await User.findOne({
       resetPasswordToken: token,
       resetPasswordExpires: { $gt: Date.now() } // Token not expired
-    });
-
-    if (!user) {
-      return res.status(400).json({ success: false, message: "Invalid or expired reset token." });
+    })
+      .select('username email resetPasswordToken resetPasswordExpires password')
+      .lean();
+    
+    const queryTime = Date.now() - queryStartTime;
+    if (queryTime > 100) {
+      console.log(`[PERFORMANCE] Token lookup took ${queryTime}ms`);
     }
 
+    if (!user) {
+      console.error(`[RESET-PASSWORD] Invalid or expired token`);
+      console.error(`   Token (first 10 chars): ${token.substring(0, 10)}...`);
+      console.error(`   Current time: ${new Date().toISOString()}`);
+      return res.status(400).json({ 
+        success: false, 
+        message: "Invalid or expired reset token. Please request a new password reset link." 
+      });
+    }
+
+    console.log(`[RESET-PASSWORD] Token validated for user: ${user.username || user.email}`);
+
     // Hash new password
+    const hashStartTime = Date.now();
     const saltRounds = 10;
     const hashedPassword = await bcrypt.hash(newPassword, saltRounds);
+    const hashTime = Date.now() - hashStartTime;
+    if (hashTime > 100) {
+      console.log(`[PERFORMANCE] Password hashing took ${hashTime}ms`);
+    }
 
-    // Update password and clear reset token
-    user.password = hashedPassword;
-    user.resetPasswordToken = null;
-    user.resetPasswordExpires = null;
-    await user.save();
+    // Update password and clear reset token using findOneAndUpdate for efficiency
+    await User.findOneAndUpdate(
+      { resetPasswordToken: token },
+      { 
+        password: hashedPassword,
+        resetPasswordToken: null,
+        resetPasswordExpires: null
+      },
+      { new: false }
+    );
 
-    console.log(`✅ Password reset successful for user: ${user.username}`);
+    console.log(`✅ [RESET-PASSWORD] Password reset successful for user: ${user.username || user.email}`);
+    console.log(`   Timestamp: ${new Date().toISOString()}`);
 
     res.status(200).json({ 
       success: true, 
       message: "Password has been reset successfully. You can now login with your new password." 
     });
   } catch (error) {
-    console.error('Reset Password Error:', error);
-    res.status(500).json({ success: false, message: "Server error resetting password." });
+    console.error('\n❌ ========== RESET PASSWORD ERROR ==========');
+    console.error('[RESET-PASSWORD] Server error resetting password');
+    console.error(`   Error Type: ${error.constructor.name}`);
+    console.error(`   Error Message: ${error.message || error.toString()}`);
+    console.error(`   Stack: ${error.stack || 'No stack trace'}`);
+    console.error(`   Timestamp: ${new Date().toISOString()}`);
+    console.error('❌ ===========================================\n');
+    
+    res.status(500).json({ 
+      success: false, 
+      message: "Server error resetting password. Please try again or request a new reset link." 
+    });
   }
 });
 
@@ -1716,6 +1911,45 @@ app.get('/api/auth/email-status', (req, res) => {
       step5: 'SMTP_PASS should be a Gmail App Password (16 characters)',
       step6: 'Redeploy your service after adding variables'
     } : null
+  });
+});
+
+// Password Reset Diagnostic Endpoint
+app.get('/api/auth/password-reset-status', (req, res) => {
+  const frontendUrl = process.env.FRONTEND_URL || (process.env.RENDER ? 'https://findmypuppy.onrender.com' : 'http://localhost:5173');
+  const emailConfigured = emailTransporter !== null;
+  const smtpUser = (process.env.SMTP_USER || process.env.EMAIL_USER || '').trim();
+  const smtpPass = (process.env.SMTP_PASS || process.env.EMAIL_PASS || '').trim();
+  
+  res.status(200).json({
+    passwordResetEnabled: emailConfigured && !!smtpUser && !!smtpPass,
+    emailServiceConfigured: emailConfigured,
+    frontendUrl: frontendUrl,
+    resetUrlTemplate: `${frontendUrl}/reset-password?token=TOKEN_HERE`,
+    environment: process.env.NODE_ENV || 'development',
+    isRender: !!process.env.RENDER,
+    checks: {
+      emailTransporter: emailConfigured ? '✅ Available' : '❌ Not available',
+      smtpUser: smtpUser ? `✅ Set (${smtpUser})` : '❌ Not set',
+      smtpPass: smtpPass ? '✅ Set' : '❌ Not set',
+      frontendUrl: frontendUrl ? `✅ ${frontendUrl}` : '❌ Not set'
+    },
+    troubleshooting: {
+      ifEmailNotWorking: [
+        '1. Check Render logs for email send errors',
+        '2. Verify SMTP_USER and SMTP_PASS are set in Render environment',
+        '3. Ensure you are using a Gmail App Password (not regular password)',
+        '4. Test email service: POST /api/auth/test-email',
+        '5. Check email status: GET /api/auth/email-status'
+      ],
+      ifResetLinkNotWorking: [
+        '1. Verify FRONTEND_URL is set correctly in Render',
+        '2. Check that the reset link uses https:// (not http://)',
+        '3. Ensure the frontend route /reset-password exists',
+        '4. Check browser console for CORS or network errors',
+        '5. Verify the token is being passed correctly in the URL'
+      ]
+    }
   });
 });
 
