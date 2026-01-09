@@ -466,6 +466,19 @@ const createTransporter = () => {
       // Gmail App Passwords: Standard configuration
       tls: {
         rejectUnauthorized: false // Allow self-signed certificates (useful for development)
+      },
+      // Connection timeout settings for Render/production environments
+      connectionTimeout: 60000, // 60 seconds to establish connection
+      socketTimeout: 60000, // 60 seconds for socket operations
+      greetingTimeout: 30000, // 30 seconds for SMTP greeting
+      // Connection pooling for better reliability
+      pool: true,
+      maxConnections: 1,
+      maxMessages: 3,
+      // Retry configuration
+      retry: {
+        attempts: 2,
+        delay: 2000
       }
     };
 
@@ -846,10 +859,16 @@ Find My Puppy | Where Adventure Meets Fun 🎮
         }
         
         // Add timeout to prevent hanging
+        // Use longer timeout for production/Render (60s) vs development (30s)
+        const isProduction = process.env.RENDER === 'true' || process.env.NODE_ENV === 'production';
+        const sendTimeout = isProduction ? 60000 : 30000; // 60s for production, 30s for dev
         const sendStartTime = Date.now();
+        
+        console.log(`   [EMAIL-SEND] Timeout set to ${sendTimeout}ms (${isProduction ? 'PRODUCTION' : 'DEVELOPMENT'})`);
+        
         const sendPromise = emailTransporter.sendMail(mailOptions);
         const timeoutPromise = new Promise((_, reject) => 
-          setTimeout(() => reject(new Error('Email send timeout after 30 seconds')), 30000)
+          setTimeout(() => reject(new Error(`Email send timeout after ${sendTimeout/1000} seconds`)), sendTimeout)
         );
         
         const info = await Promise.race([sendPromise, timeoutPromise]);
@@ -905,6 +924,13 @@ Find My Puppy | Where Adventure Meets Fun 🎮
           console.error('      - Check network connectivity from Render');
           console.error('      - Verify SMTP_HOST and SMTP_PORT are correct');
           console.error('      - Gmail SMTP might be blocking connections from Render');
+        } else if (emailError.message && emailError.message.includes('timeout')) {
+          console.error('   ⏱️  Timeout Issue Detected:');
+          console.error('      - Gmail SMTP may be blocking connections from Render IP addresses');
+          console.error('      - Try using port 465 with SMTP_SECURE=true instead of 587');
+          console.error('      - Consider using a different email service (SendGrid, Mailgun, etc.)');
+          console.error('      - Check Render firewall/network restrictions');
+          console.error('      - Gmail may require "Less secure app access" or App Passwords');
         }
         
         // Log the reset URL as fallback for manual testing
@@ -924,7 +950,11 @@ Find My Puppy | Where Adventure Meets Fun 🎮
           userMessage = "Unable to connect to email service. Please try again in a few moments.";
         } else if (emailError.message && emailError.message.includes('timeout')) {
           errorType = "TIMEOUT_ERROR";
-          userMessage = "Email service timed out. Please try again.";
+          userMessage = "Email service is experiencing delays. The reset link has been generated. Please check the server logs for the reset link or try again in a few moments.";
+          // Log the reset URL prominently for timeout cases
+          console.error('\n⚠️  IMPORTANT: Email timeout occurred, but reset token was generated:');
+          console.error(`   Reset URL: ${resetUrl}`);
+          console.error('   You can manually share this link with the user if needed.\n');
         } else if (emailError.code) {
           errorType = emailError.code;
         }
