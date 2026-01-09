@@ -82,7 +82,7 @@ mongoose.connect(MONGO_URI)
 // Schema Definition
 const userSchema = new mongoose.Schema({
   username: { type: String, required: true },
-  email: { type: String, required: true, unique: true, index: true }, // Indexed for faster lookups
+  email: { type: String, required: true, unique: true }, // Unique constraint automatically creates an index for fast lookups
   password: { type: String, required: false }, // Optional for OAuth users
   googleId: { type: String, unique: true, sparse: true }, // Google OAuth ID
   authProvider: { type: String, enum: ['local', 'google'], default: 'local' }, // Track auth method
@@ -102,8 +102,8 @@ const userSchema = new mongoose.Schema({
 // Ensure strict is false for this model just in case
 userSchema.set('strict', false);
 
-// Create index on email field for optimized queries (if not already exists)
-userSchema.index({ email: 1 });
+// Note: Email field already has index via 'unique: true' and 'index: true' in schema definition
+// No need for explicit userSchema.index() call to avoid duplicate index warning
 
 // Clear model cache to ensure latest schema is used
 if (mongoose.models['User']) {
@@ -488,12 +488,24 @@ const createTransporter = () => {
 };
 
 const emailTransporter = createTransporter();
+
+// Enhanced startup logging for Render debugging
+console.log('\n📧 ========== EMAIL SERVICE INITIALIZATION ==========');
 if (emailTransporter) {
-  console.log('📧 Email service configured for password reset');
+  console.log('✅ Email transporter created successfully');
 } else {
-  console.warn('⚠️ Email service not configured. Set SMTP_USER and SMTP_PASS environment variables for password reset functionality.');
-  console.warn('   Example: SMTP_USER=your-email@gmail.com SMTP_PASS=your-app-password');
+  console.error('❌ Email transporter NOT created');
+  const smtpUser = (process.env.SMTP_USER || process.env.EMAIL_USER || '').trim();
+  const smtpPass = (process.env.SMTP_PASS || process.env.EMAIL_PASS || '').trim();
+  console.error(`   SMTP_USER exists: ${!!smtpUser} (length: ${smtpUser.length})`);
+  console.error(`   SMTP_PASS exists: ${!!smtpPass} (length: ${smtpPass.length})`);
+  console.error('   Environment check:');
+  console.error(`     NODE_ENV: ${process.env.NODE_ENV || 'not set'}`);
+  console.error(`     RENDER: ${process.env.RENDER || 'not set'}`);
+  console.error('   ⚠️  Set SMTP_USER and SMTP_PASS environment variables in Render dashboard');
+  console.error('   Example: SMTP_USER=your-email@gmail.com SMTP_PASS=your-app-password');
 }
+console.log('📧 ================================================\n');
 
 // Password Reset Request Endpoint
 app.post('/api/auth/forgot-password', async (req, res) => {
@@ -564,24 +576,36 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     const resetUrl = `${process.env.FRONTEND_URL || 'http://findmypuppy.onrender.com'}/reset-password?token=${resetToken}`;
 
     // Send email if transporter is configured
-    if (emailTransporter) {
-      const fromEmail = (process.env.SMTP_USER || process.env.EMAIL_USER || '').trim();
-      
-      // Validate email configuration before sending
-      if (!fromEmail) {
-        console.error('❌ Email configuration error: SMTP_USER or EMAIL_USER not set');
-        console.log(`🔗 Fallback: Password reset link for ${user.email}: ${resetUrl}`);
-        return res.status(200).json({ 
-          success: true, 
-          message: "If an account with that email exists, a password reset link has been sent." 
-        });
-      }
+    if (!emailTransporter) {
+      console.error('❌ [FORGOT-PASSWORD] Email transporter is not available');
+      console.error('   This should not happen if environment variables are set correctly');
+      console.error('   Check Render logs for email service initialization errors');
+      console.log(`🔗 Fallback: Password reset link for ${user.email}: ${resetUrl}`);
+      return res.status(500).json({ 
+        success: false, 
+        message: "Email service is temporarily unavailable. Please try again later or contact support." 
+      });
+    }
 
-      console.log(`📧 Preparing to send password reset email:`);
-      console.log(`   To: ${user.email}`);
-      console.log(`   From: ${fromEmail}`);
-      console.log(`   Environment: ${process.env.NODE_ENV || 'development'}`);
-      console.log(`   Render: ${process.env.RENDER ? 'true' : 'false'}`);
+    const fromEmail = (process.env.SMTP_USER || process.env.EMAIL_USER || '').trim();
+    
+    // Validate email configuration before sending
+    if (!fromEmail) {
+      console.error('❌ [FORGOT-PASSWORD] Email configuration error: SMTP_USER or EMAIL_USER not set');
+      console.error('   Check Render environment variables');
+      console.log(`🔗 Fallback: Password reset link for ${user.email}: ${resetUrl}`);
+      return res.status(500).json({ 
+        success: false, 
+        message: "Email service configuration error. Please contact support." 
+      });
+    }
+
+    console.log(`📧 [FORGOT-PASSWORD] Preparing to send password reset email:`);
+    console.log(`   To: ${user.email}`);
+    console.log(`   From: ${fromEmail}`);
+    console.log(`   Environment: ${process.env.NODE_ENV || 'development'}`);
+    console.log(`   Render: ${process.env.RENDER ? 'true' : 'false'}`);
+    console.log(`   Transporter available: ${emailTransporter !== null}`);
       
       const mailOptions = {
         from: `"Find My Puppy 🐾" <${fromEmail}>`,
@@ -796,21 +820,18 @@ Find My Puppy | Where Adventure Meets Fun 🎮
         console.error(`🔗 Fallback: Password reset link for ${user.email}:`);
         console.error(`   ${resetUrl}`);
         
-        // In production, still return success to user (security best practice)
-        // But log the error for debugging
-        if (process.env.RENDER || process.env.NODE_ENV === 'production') {
-          console.error(`   [PRODUCTION] Email send failed but returning success to user for security`);
-        }
+        // Return error to user so they know email failed
+        // This helps with debugging and user experience
+        return res.status(500).json({ 
+          success: false, 
+          message: "Failed to send password reset email. Please try again later or contact support." 
+        });
       }
-    } else {
-      // If email service not configured, log the reset URL for development
-      console.warn(`⚠️ Email service not configured. Password reset link for ${user.email}:`);
-      console.log(`🔗 ${resetUrl}`);
-    }
 
+    // Success response
     res.status(200).json({ 
       success: true, 
-      message: "If an account with that email exists, a password reset link has been sent." 
+      message: "Password reset link has been sent to your email address." 
     });
   } catch (error) {
     console.error('Forgot Password Error:', error);
@@ -1542,16 +1563,37 @@ app.post('/api/auth/test-email', async (req, res) => {
   try {
     const { testEmail } = req.body;
     
+    console.log('\n🧪 [TEST-EMAIL] Test email request received');
+    console.log(`   Test Email: ${testEmail || 'not provided (will use fromEmail)'}`);
+    console.log(`   Transporter available: ${emailTransporter !== null}`);
+    
     if (!emailTransporter) {
+      console.error('❌ [TEST-EMAIL] Email transporter not available');
       return res.status(503).json({ 
         success: false, 
         message: "Email service not configured. Set SMTP_USER and SMTP_PASS environment variables.",
+        configured: false,
+        troubleshooting: "Check Render environment variables and server startup logs"
+      });
+    }
+
+    const fromEmail = (process.env.SMTP_USER || process.env.EMAIL_USER || '').trim();
+    const toEmail = (testEmail || fromEmail).trim();
+    
+    if (!fromEmail) {
+      console.error('❌ [TEST-EMAIL] From email not configured');
+      return res.status(503).json({ 
+        success: false, 
+        message: "SMTP_USER or EMAIL_USER not set in environment variables.",
         configured: false
       });
     }
 
-    const fromEmail = process.env.SMTP_USER || process.env.EMAIL_USER;
-    const toEmail = testEmail || fromEmail;
+    console.log(`📧 [TEST-EMAIL] Preparing to send test email:`);
+    console.log(`   From: ${fromEmail}`);
+    console.log(`   To: ${toEmail}`);
+    console.log(`   Environment: ${process.env.NODE_ENV || 'development'}`);
+    console.log(`   Render: ${process.env.RENDER ? 'true' : 'false'}`);
 
     const testMailOptions = {
       from: `"Find My Puppy Test" <${fromEmail}>`,
@@ -1571,31 +1613,66 @@ app.post('/api/auth/test-email', async (req, res) => {
               If you received this email, the email configuration is correct! ✅
             </p>
             <p style="color: #999; font-size: 12px; margin-top: 30px; padding-top: 20px; border-top: 1px solid #ddd;">
-              Sent at: ${new Date().toLocaleString()}
+              Sent at: ${new Date().toLocaleString()}<br>
+              Environment: ${process.env.NODE_ENV || 'development'}<br>
+              Render: ${process.env.RENDER ? 'true' : 'false'}
             </p>
           </div>
         </div>
       `,
-      text: `Test Email - Find My Puppy Email Service\n\nThis is a test email to verify that the email service is working correctly.\n\nSent at: ${new Date().toLocaleString()}`
+      text: `Test Email - Find My Puppy Email Service\n\nThis is a test email to verify that the email service is working correctly.\n\nSent at: ${new Date().toLocaleString()}\nEnvironment: ${process.env.NODE_ENV || 'development'}`
     };
 
+    console.log(`📤 [TEST-EMAIL] Sending test email...`);
+    const sendStartTime = Date.now();
+    
     const info = await emailTransporter.sendMail(testMailOptions);
+    const sendTime = Date.now() - sendStartTime;
+    
+    console.log(`✅ [TEST-EMAIL] Test email sent successfully!`);
+    console.log(`   Message ID: ${info.messageId || 'N/A'}`);
+    console.log(`   Response: ${info.response || 'Email accepted by server'}`);
+    console.log(`   Send time: ${sendTime}ms`);
     
     res.status(200).json({ 
       success: true, 
       message: `Test email sent successfully to ${toEmail}`,
       messageId: info.messageId,
       response: info.response,
-      configured: true
+      sendTime: `${sendTime}ms`,
+      configured: true,
+      fromEmail: fromEmail,
+      toEmail: toEmail
     });
   } catch (error) {
-    console.error('Test Email Error:', error);
+    console.error('❌ [TEST-EMAIL] Failed to send test email');
+    console.error(`   Error Type: ${error.constructor.name}`);
+    console.error(`   Error Code: ${error.code || 'UNKNOWN'}`);
+    console.error(`   Error Message: ${error.message || error.toString()}`);
+    if (error.response) {
+      console.error(`   SMTP Response: ${error.response}`);
+    }
+    if (error.responseCode) {
+      console.error(`   SMTP Response Code: ${error.responseCode}`);
+    }
+    if (error.stack) {
+      console.error(`   Stack: ${error.stack}`);
+    }
+    
     res.status(500).json({ 
       success: false, 
       message: "Failed to send test email",
       error: error.message,
       code: error.code,
-      configured: emailTransporter !== null
+      responseCode: error.responseCode,
+      response: error.response,
+      configured: emailTransporter !== null,
+      troubleshooting: {
+        step1: "Check Render logs for detailed error information",
+        step2: "Verify SMTP_USER and SMTP_PASS are set correctly",
+        step3: "Ensure you're using a Gmail App Password (not regular password)",
+        step4: "Check that 2FA is enabled on your Google account"
+      }
     });
   }
 });
