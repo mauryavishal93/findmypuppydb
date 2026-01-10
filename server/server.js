@@ -495,35 +495,58 @@ const createTransporter = () => {
 
     const transporter = nodemailer.createTransport(emailConfig);
     
-    // Verify transporter connection on startup (non-blocking)
-    // Note: Verification failure won't prevent emails from being sent
-    transporter.verify((error, success) => {
-      if (error) {
-        console.error('❌ Email service verification failed:');
-        console.error(`   Error: ${error.message}`);
-        if (error.responseCode === 535 || error.responseCode === '535') {
-          console.error('   🔐 Authentication Error:');
-          console.error('      - Make sure you are using an App Password (not your regular Gmail password)');
-          console.error('      - Ensure 2-Factor Authentication is enabled on your Google account');
-          console.error('      - Generate a new App Password at: https://myaccount.google.com/apppasswords');
-          console.error('      - Check that SMTP_USER and SMTP_PASS environment variables are set correctly');
-          console.error('      - Verify the password has no extra spaces (it should be trimmed automatically)');
+    // Skip verification if SKIP_EMAIL_VERIFY is set (useful for production when Gmail blocks connections)
+    const skipVerification = process.env.SKIP_EMAIL_VERIFY === 'true' || 
+                              (process.env.RENDER === 'true' && process.env.SKIP_EMAIL_VERIFY !== 'false');
+    
+    if (skipVerification) {
+      console.log('⚠️  Email verification skipped (SKIP_EMAIL_VERIFY=true or Render detected)');
+      console.log('   Email transporter created. Verification will happen on first email send.');
+      console.log('   This is recommended when Gmail SMTP blocks connections from cloud platforms.');
+    } else {
+      // Verify transporter connection on startup (non-blocking with timeout)
+      // Note: Verification failure won't prevent emails from being sent
+      const verifyTimeout = setTimeout(() => {
+        console.warn('⏱️  Email verification is taking too long, skipping...');
+        console.warn('   Email transporter created. Verification will happen on first email send.');
+        console.warn('   If this happens frequently, set SKIP_EMAIL_VERIFY=true in environment variables.');
+      }, 10000); // 10 second timeout for verification
+      
+      transporter.verify((error, success) => {
+        clearTimeout(verifyTimeout);
+        if (error) {
+          console.error('❌ Email service verification failed:');
+          console.error(`   Error: ${error.message}`);
+          if (error.responseCode === 535 || error.responseCode === '535') {
+            console.error('   🔐 Authentication Error:');
+            console.error('      - Make sure you are using an App Password (not your regular Gmail password)');
+            console.error('      - Ensure 2-Factor Authentication is enabled on your Google account');
+            console.error('      - Generate a new App Password at: https://myaccount.google.com/apppasswords');
+            console.error('      - Check that SMTP_USER and SMTP_PASS environment variables are set correctly');
+            console.error('      - Verify the password has no extra spaces (it should be trimmed automatically)');
+          } else if (error.message && error.message.includes('timeout')) {
+            console.error('   ⏱️  Connection Timeout:');
+            console.error('      - Gmail SMTP may be blocking connections from this IP address');
+            console.error('      - This is common on cloud platforms like Render');
+            console.error('      - Set SKIP_EMAIL_VERIFY=true to skip verification (emails will still work)');
+            console.error('      - Consider using a different email service (SendGrid, Mailgun, etc.)');
+          } else {
+            console.error('   Please check your SMTP credentials in environment variables.');
+          }
+          if (error.command) {
+            console.error(`   Command: ${error.command}`);
+          }
+          if (error.response) {
+            console.error(`   Response: ${error.response}`);
+          }
+          console.warn('⚠️  Email transporter created but verification failed. Emails may still work, but please verify your credentials.');
         } else {
-          console.error('   Please check your SMTP credentials in environment variables.');
+          console.log('✅ Email service verified and ready');
+          console.log(`   SMTP Host: ${smtpHost}:${smtpPort}`);
+          console.log(`   From Email: ${smtpUser}`);
         }
-        if (error.command) {
-          console.error(`   Command: ${error.command}`);
-        }
-        if (error.response) {
-          console.error(`   Response: ${error.response}`);
-        }
-        console.warn('⚠️  Email transporter created but verification failed. Emails may still work, but please verify your credentials.');
-      } else {
-        console.log('✅ Email service verified and ready');
-        console.log(`   SMTP Host: ${smtpHost}:${smtpPort}`);
-        console.log(`   From Email: ${smtpUser}`);
-      }
-    });
+      });
+    }
     
     return transporter;
   }
