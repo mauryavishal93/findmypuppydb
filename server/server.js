@@ -555,7 +555,6 @@ const createTransporter = () => {
             console.error('      - Gmail SMTP may be blocking connections from this IP address');
             console.error('      - This is common on cloud platforms like Render');
             console.error('      - Set SKIP_EMAIL_VERIFY=true to skip verification (emails will still work)');
-            console.error('      - Consider using a different email service (SendGrid, Mailgun, etc.)');
           } else {
             console.error('   Please check your SMTP credentials in environment variables.');
           }
@@ -1005,8 +1004,7 @@ Find My Puppy | Where Adventure Meets Fun 🎮
           console.error('           SMTP_PORT=465');
           console.error('           SMTP_SECURE=true');
           console.error('        2. Check Render logs for specific connection errors');
-          console.error('        3. Consider using SendGrid or Mailgun (better for cloud platforms)');
-          console.error('        4. Verify SMTP_USER and SMTP_PASS are correct');
+          console.error('        3. Verify SMTP_USER and SMTP_PASS are correct');
           console.error('        5. Ensure you are using Gmail App Password (not regular password)');
         } else if (emailError.message && emailError.message.includes('timeout')) {
           console.error('   ⏱️  Timeout Issue Detected:');
@@ -1016,7 +1014,6 @@ Find My Puppy | Where Adventure Meets Fun 🎮
           console.error('         Set in Render environment variables:');
           console.error('         SMTP_PORT=465');
           console.error('         SMTP_SECURE=true');
-          console.error('      - Alternative: Use SendGrid or Mailgun (designed for cloud platforms)');
           console.error('      - Current config: Port ' + (process.env.SMTP_PORT || '587') + ', Secure: ' + (process.env.SMTP_SECURE || 'false'));
         }
         
