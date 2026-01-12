@@ -479,10 +479,10 @@ const createTransporter = () => {
         minVersion: 'TLSv1'
       },
       // Connection timeout settings for Render/production environments
-      // Longer timeouts for production to handle network latency
-      connectionTimeout: isProduction ? 90000 : 60000, // 90s for production, 60s for dev
-      socketTimeout: isProduction ? 90000 : 60000, // 90s for production, 60s for dev
-      greetingTimeout: isProduction ? 45000 : 30000, // 45s for production, 30s for dev
+      // Longer timeouts for production to handle Gmail SMTP slowness on cloud platforms
+      connectionTimeout: isProduction ? 120000 : 60000, // 120s (2 min) for production, 60s for dev
+      socketTimeout: isProduction ? 120000 : 60000, // 120s (2 min) for production, 60s for dev
+      greetingTimeout: isProduction ? 60000 : 30000, // 60s for production, 30s for dev
       // Connection pooling for better reliability
       pool: true,
       maxConnections: 1,
@@ -899,48 +899,97 @@ Find My Puppy | Where Adventure Meets Fun 🎮
 
       // Send email asynchronously (non-blocking) to prevent request timeout
       // This allows password reset to work even if email service is unavailable
+      // IMPORTANT: Email is sent in background - response is sent immediately to user
       const sendEmailAsync = async () => {
         const isProduction = process.env.RENDER === 'true' || process.env.NODE_ENV === 'production';
-        const sendTimeout = isProduction ? 90000 : 30000; // 90s for production, 30s for dev
+        // Use longer timeout for production to handle Gmail SMTP slowness on cloud platforms
+        const sendTimeout = isProduction ? 120000 : 30000; // 120s (2 min) for production, 30s for dev
         let lastError = null;
         
         // Try sending with current transporter first
-        const trySendEmail = async (attempt = 1, maxAttempts = 2) => {
+        // If it fails with timeout/connection error, try creating a new transporter with port 465
+        const trySendEmail = async (attempt = 1, maxAttempts = 3, useFallbackPort = false) => {
           try {
+            let transporterToUse = emailTransporter;
+            
+            // On second attempt in production, try port 465 as fallback if currently using 587
+            if (attempt === 2 && isProduction && !useFallbackPort) {
+              const currentPort = parseInt(process.env.SMTP_PORT || (isProduction ? '465' : '587'));
+              if (currentPort === 587) {
+                console.log(`   🔄 [FALLBACK] Attempting to create new transporter with port 465 (SSL)...`);
+                try {
+                  const fallbackConfig = {
+                    host: (process.env.SMTP_HOST || 'smtp.gmail.com').trim(),
+                    port: 465,
+                    secure: true, // Required for port 465
+                    auth: {
+                      user: fromEmail,
+                      pass: (process.env.SMTP_PASS || process.env.EMAIL_PASS || '').trim()
+                    },
+                    tls: {
+                      rejectUnauthorized: false
+                    },
+                    connectionTimeout: 120000,
+                    socketTimeout: 120000,
+                    greetingTimeout: 60000
+                  };
+                  transporterToUse = nodemailer.createTransport(fallbackConfig);
+                  console.log(`   ✅ [FALLBACK] Created fallback transporter with port 465`);
+                  useFallbackPort = true;
+                } catch (fallbackError) {
+                  console.error(`   ❌ [FALLBACK] Failed to create fallback transporter: ${fallbackError.message}`);
+                }
+              }
+            }
+            
             console.log(`📤 [FORGOT-PASSWORD] Attempt ${attempt}/${maxAttempts}: Sending password reset email to ${user.email}...`);
             console.log(`   Mail options prepared: from="${fromEmail}", to="${user.email}"`);
+            if (useFallbackPort) {
+              console.log(`   Using fallback configuration: Port 465 with SSL`);
+            }
             
             // Verify transporter is still valid before sending
-            if (!emailTransporter || typeof emailTransporter.sendMail !== 'function') {
+            if (!transporterToUse || typeof transporterToUse.sendMail !== 'function') {
               throw new Error('Email transporter is not properly initialized');
             }
             
             const sendStartTime = Date.now();
             console.log(`   [EMAIL-SEND] Timeout set to ${sendTimeout}ms (${isProduction ? 'PRODUCTION' : 'DEVELOPMENT'})`);
             
-            const sendPromise = emailTransporter.sendMail(mailOptions);
-            const timeoutPromise = new Promise((_, reject) => 
-              setTimeout(() => reject(new Error(`Email send timeout after ${sendTimeout/1000} seconds`)), sendTimeout)
-            );
+            // Use AbortController for better timeout handling
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => {
+              controller.abort();
+            }, sendTimeout);
             
-            const info = await Promise.race([sendPromise, timeoutPromise]);
-            const sendDuration = Date.now() - sendStartTime;
-            console.log(`   Email send completed in ${sendDuration}ms`);
-            
-            console.log(`✅ Password reset email sent successfully!`);
-            console.log(`   Message ID: ${info.messageId || 'N/A'}`);
-            console.log(`   To: ${user.email}`);
-            console.log(`   From: ${fromEmail}`);
-            console.log(`   Response: ${info.response || 'Email accepted by server'}`);
-            console.log(`   Envelope: ${JSON.stringify(info.envelope || {})}`);
-            
-            // Additional production logging
-            if (isProduction) {
-              console.log(`   [PRODUCTION] Email sent at: ${new Date().toISOString()}`);
-              console.log(`   [PRODUCTION] Reset URL: ${resetUrl.substring(0, 50)}...`);
+            try {
+              const sendPromise = transporterToUse.sendMail(mailOptions);
+              const timeoutPromise = new Promise((_, reject) => 
+                setTimeout(() => reject(new Error(`Email send timeout after ${sendTimeout/1000} seconds`)), sendTimeout)
+              );
+              
+              const info = await Promise.race([sendPromise, timeoutPromise]);
+              clearTimeout(timeoutId);
+              const sendDuration = Date.now() - sendStartTime;
+              console.log(`   Email send completed in ${sendDuration}ms`);
+              
+              console.log(`✅ Password reset email sent successfully!`);
+              console.log(`   Message ID: ${info.messageId || 'N/A'}`);
+              console.log(`   To: ${user.email}`);
+              console.log(`   From: ${fromEmail}`);
+              console.log(`   Response: ${info.response || 'Email accepted by server'}`);
+              console.log(`   Envelope: ${JSON.stringify(info.envelope || {})}`);
+              
+              // Additional production logging
+              if (isProduction) {
+                console.log(`   [PRODUCTION] Email sent at: ${new Date().toISOString()}`);
+                console.log(`   [PRODUCTION] Reset URL: ${resetUrl.substring(0, 50)}...`);
+              }
+              
+              return info; // Success
+            } finally {
+              clearTimeout(timeoutId);
             }
-            
-            return info; // Success
           } catch (error) {
             lastError = error;
             
@@ -951,10 +1000,11 @@ Find My Puppy | Where Adventure Meets Fun 🎮
               error.code === 'ESOCKET' ||
               (error.message && error.message.includes('timeout'))
             )) {
-              const retryDelay = attempt * 2000; // Exponential backoff: 2s, 4s
-              console.warn(`   ⚠️  Connection error on attempt ${attempt}, retrying in ${retryDelay}ms...`);
+              const retryDelay = attempt * 3000; // Exponential backoff: 3s, 6s, 9s
+              console.warn(`   ⚠️  Connection/timeout error on attempt ${attempt}, retrying in ${retryDelay}ms...`);
+              console.warn(`   Error: ${error.message || error.code || 'Unknown'}`);
               await new Promise(resolve => setTimeout(resolve, retryDelay));
-              return trySendEmail(attempt + 1, maxAttempts);
+              return trySendEmail(attempt + 1, maxAttempts, useFallbackPort);
             }
             
             throw error; // Re-throw if no more retries or different error
