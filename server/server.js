@@ -446,9 +446,17 @@ const createTransporter = () => {
   const smtpPass = (process.env.SMTP_PASS || process.env.EMAIL_PASS || '').trim();
   
   // Get SMTP settings
+  // For production/Render: Try port 465 with SSL first (more reliable than 587)
+  const isProduction = process.env.RENDER === 'true' || process.env.NODE_ENV === 'production';
   const smtpHost = (process.env.SMTP_HOST || 'smtp.gmail.com').trim();
-  const smtpPort = parseInt(process.env.SMTP_PORT || '587');
-  const smtpSecure = process.env.SMTP_SECURE === 'true'; // true for 465, false for other ports
+  // Default to port 465 for production (more reliable on cloud platforms)
+  const defaultPort = isProduction ? 465 : 587;
+  const smtpPort = parseInt(process.env.SMTP_PORT || defaultPort.toString());
+  // Default to secure=true for production (port 465 requires SSL)
+  const defaultSecure = isProduction ? true : false;
+  const smtpSecure = process.env.SMTP_SECURE !== undefined 
+    ? process.env.SMTP_SECURE === 'true' 
+    : defaultSecure;
 
   // Only create transporter if credentials are provided
   if (smtpUser && smtpPass) {
@@ -465,21 +473,31 @@ const createTransporter = () => {
       },
       // Gmail App Passwords: Standard configuration
       tls: {
-        rejectUnauthorized: false // Allow self-signed certificates (useful for development)
+        rejectUnauthorized: false, // Allow self-signed certificates (useful for development)
+        // Additional TLS options for production
+        ciphers: 'SSLv3',
+        minVersion: 'TLSv1'
       },
       // Connection timeout settings for Render/production environments
-      connectionTimeout: 60000, // 60 seconds to establish connection
-      socketTimeout: 60000, // 60 seconds for socket operations
-      greetingTimeout: 30000, // 30 seconds for SMTP greeting
+      // Longer timeouts for production to handle network latency
+      connectionTimeout: isProduction ? 90000 : 60000, // 90s for production, 60s for dev
+      socketTimeout: isProduction ? 90000 : 60000, // 90s for production, 60s for dev
+      greetingTimeout: isProduction ? 45000 : 30000, // 45s for production, 30s for dev
       // Connection pooling for better reliability
       pool: true,
       maxConnections: 1,
       maxMessages: 3,
-      // Retry configuration
+      // Retry configuration - more retries for production
       retry: {
-        attempts: 2,
-        delay: 2000
-      }
+        attempts: isProduction ? 3 : 2,
+        delay: isProduction ? 3000 : 2000
+      },
+      // Additional options for production
+      ...(isProduction && {
+        requireTLS: true, // Require TLS for security
+        debug: false, // Set to true for detailed SMTP debugging
+        logger: false // Disable default logger (we use our own)
+      })
     };
 
     // Debug: Show configuration (mask password)
@@ -488,10 +506,18 @@ const createTransporter = () => {
       : '****';
     console.log('📧 Email Configuration:');
     console.log(`   Host: ${smtpHost}`);
-    console.log(`   Port: ${smtpPort}`);
-    console.log(`   Secure: ${smtpSecure}`);
+    console.log(`   Port: ${smtpPort} ${isProduction ? '(Production default: 465)' : '(Development default: 587)'}`);
+    console.log(`   Secure: ${smtpSecure} ${isProduction ? '(Production default: true for port 465)' : '(Development default: false for port 587)'}`);
     console.log(`   User: ${smtpUser}`);
     console.log(`   Pass: ${maskedPass}`);
+    if (isProduction) {
+      console.log(`   ⚠️  PRODUCTION MODE: Using optimized settings for cloud platforms`);
+      if (smtpPort === 587 && !smtpSecure) {
+        console.warn(`   ⚠️  WARNING: Port 587 may be blocked by Gmail on cloud platforms`);
+        console.warn(`   💡 RECOMMENDATION: Set SMTP_PORT=465 and SMTP_SECURE=true in Render`);
+        console.warn(`   💡 This is more reliable for production deployments`);
+      }
+    }
 
     const transporter = nodemailer.createTransport(emailConfig);
     
@@ -875,44 +901,69 @@ Find My Puppy | Where Adventure Meets Fun 🎮
       // Send email asynchronously (non-blocking) to prevent request timeout
       // This allows password reset to work even if email service is unavailable
       const sendEmailAsync = async () => {
+        const isProduction = process.env.RENDER === 'true' || process.env.NODE_ENV === 'production';
+        const sendTimeout = isProduction ? 90000 : 30000; // 90s for production, 30s for dev
+        let lastError = null;
+        
+        // Try sending with current transporter first
+        const trySendEmail = async (attempt = 1, maxAttempts = 2) => {
+          try {
+            console.log(`📤 [FORGOT-PASSWORD] Attempt ${attempt}/${maxAttempts}: Sending password reset email to ${user.email}...`);
+            console.log(`   Mail options prepared: from="${fromEmail}", to="${user.email}"`);
+            
+            // Verify transporter is still valid before sending
+            if (!emailTransporter || typeof emailTransporter.sendMail !== 'function') {
+              throw new Error('Email transporter is not properly initialized');
+            }
+            
+            const sendStartTime = Date.now();
+            console.log(`   [EMAIL-SEND] Timeout set to ${sendTimeout}ms (${isProduction ? 'PRODUCTION' : 'DEVELOPMENT'})`);
+            
+            const sendPromise = emailTransporter.sendMail(mailOptions);
+            const timeoutPromise = new Promise((_, reject) => 
+              setTimeout(() => reject(new Error(`Email send timeout after ${sendTimeout/1000} seconds`)), sendTimeout)
+            );
+            
+            const info = await Promise.race([sendPromise, timeoutPromise]);
+            const sendDuration = Date.now() - sendStartTime;
+            console.log(`   Email send completed in ${sendDuration}ms`);
+            
+            console.log(`✅ Password reset email sent successfully!`);
+            console.log(`   Message ID: ${info.messageId || 'N/A'}`);
+            console.log(`   To: ${user.email}`);
+            console.log(`   From: ${fromEmail}`);
+            console.log(`   Response: ${info.response || 'Email accepted by server'}`);
+            console.log(`   Envelope: ${JSON.stringify(info.envelope || {})}`);
+            
+            // Additional production logging
+            if (isProduction) {
+              console.log(`   [PRODUCTION] Email sent at: ${new Date().toISOString()}`);
+              console.log(`   [PRODUCTION] Reset URL: ${resetUrl.substring(0, 50)}...`);
+            }
+            
+            return info; // Success
+          } catch (error) {
+            lastError = error;
+            
+            // If connection/timeout error and we have retries left, try again
+            if (attempt < maxAttempts && (
+              error.code === 'ETIMEDOUT' || 
+              error.code === 'ECONNECTION' || 
+              error.code === 'ESOCKET' ||
+              (error.message && error.message.includes('timeout'))
+            )) {
+              const retryDelay = attempt * 2000; // Exponential backoff: 2s, 4s
+              console.warn(`   ⚠️  Connection error on attempt ${attempt}, retrying in ${retryDelay}ms...`);
+              await new Promise(resolve => setTimeout(resolve, retryDelay));
+              return trySendEmail(attempt + 1, maxAttempts);
+            }
+            
+            throw error; // Re-throw if no more retries or different error
+          }
+        };
+        
         try {
-          console.log(`📤 [FORGOT-PASSWORD] Attempting to send password reset email to ${user.email}...`);
-          console.log(`   Mail options prepared: from="${fromEmail}", to="${user.email}"`);
-          
-          // Verify transporter is still valid before sending
-          if (!emailTransporter || typeof emailTransporter.sendMail !== 'function') {
-            throw new Error('Email transporter is not properly initialized');
-          }
-          
-          // Add timeout to prevent hanging
-          // Use longer timeout for production/Render (60s) vs development (30s)
-          const isProduction = process.env.RENDER === 'true' || process.env.NODE_ENV === 'production';
-          const sendTimeout = isProduction ? 60000 : 30000; // 60s for production, 30s for dev
-          const sendStartTime = Date.now();
-          
-          console.log(`   [EMAIL-SEND] Timeout set to ${sendTimeout}ms (${isProduction ? 'PRODUCTION' : 'DEVELOPMENT'})`);
-          
-          const sendPromise = emailTransporter.sendMail(mailOptions);
-          const timeoutPromise = new Promise((_, reject) => 
-            setTimeout(() => reject(new Error(`Email send timeout after ${sendTimeout/1000} seconds`)), sendTimeout)
-          );
-          
-          const info = await Promise.race([sendPromise, timeoutPromise]);
-          const sendDuration = Date.now() - sendStartTime;
-          console.log(`   Email send completed in ${sendDuration}ms`);
-          
-          console.log(`✅ Password reset email sent successfully!`);
-          console.log(`   Message ID: ${info.messageId || 'N/A'}`);
-          console.log(`   To: ${user.email}`);
-          console.log(`   From: ${fromEmail}`);
-          console.log(`   Response: ${info.response || 'Email accepted by server'}`);
-          console.log(`   Envelope: ${JSON.stringify(info.envelope || {})}`);
-          
-          // Additional production logging
-          if (process.env.RENDER || process.env.NODE_ENV === 'production') {
-            console.log(`   [PRODUCTION] Email sent at: ${new Date().toISOString()}`);
-            console.log(`   [PRODUCTION] Reset URL: ${resetUrl.substring(0, 50)}...`);
-          }
+          await trySendEmail();
         } catch (emailError) {
         console.error('\n❌ ========== EMAIL SEND ERROR ==========');
         console.error(`[FORGOT-PASSWORD] Failed to send password reset email`);
@@ -945,18 +996,28 @@ Find My Puppy | Where Adventure Meets Fun 🎮
           console.error('      - Verify SMTP_USER and SMTP_PASS are set correctly in Render');
           console.error('      - Check that you are using a Gmail App Password');
           console.error('      - Ensure 2FA is enabled on your Google account');
-        } else if (emailError.code === 'ETIMEDOUT' || emailError.code === 'ECONNECTION') {
+        } else if (emailError.code === 'ETIMEDOUT' || emailError.code === 'ECONNECTION' || emailError.code === 'ESOCKET') {
           console.error('   🌐 Connection Issue Detected:');
-          console.error('      - Check network connectivity from Render');
-          console.error('      - Verify SMTP_HOST and SMTP_PORT are correct');
-          console.error('      - Gmail SMTP might be blocking connections from Render');
+          console.error('      - Gmail SMTP is likely blocking connections from Render IP addresses');
+          console.error('      - This is a common issue with Gmail SMTP on cloud platforms');
+          console.error('      - SOLUTIONS:');
+          console.error('        1. Try port 465 with SMTP_SECURE=true (set in Render environment):');
+          console.error('           SMTP_PORT=465');
+          console.error('           SMTP_SECURE=true');
+          console.error('        2. Check Render logs for specific connection errors');
+          console.error('        3. Consider using SendGrid or Mailgun (better for cloud platforms)');
+          console.error('        4. Verify SMTP_USER and SMTP_PASS are correct');
+          console.error('        5. Ensure you are using Gmail App Password (not regular password)');
         } else if (emailError.message && emailError.message.includes('timeout')) {
           console.error('   ⏱️  Timeout Issue Detected:');
-          console.error('      - Gmail SMTP may be blocking connections from Render IP addresses');
-          console.error('      - Try using port 465 with SMTP_SECURE=true instead of 587');
-          console.error('      - Consider using a different email service (SendGrid, Mailgun, etc.)');
-          console.error('      - Check Render firewall/network restrictions');
-          console.error('      - Gmail may require "Less secure app access" or App Passwords');
+          console.error('      - Gmail SMTP connection is timing out from Render');
+          console.error('      - This usually means Gmail is blocking the connection');
+          console.error('      - RECOMMENDED FIX: Use port 465 with SSL:');
+          console.error('         Set in Render environment variables:');
+          console.error('         SMTP_PORT=465');
+          console.error('         SMTP_SECURE=true');
+          console.error('      - Alternative: Use SendGrid or Mailgun (designed for cloud platforms)');
+          console.error('      - Current config: Port ' + (process.env.SMTP_PORT || '587') + ', Secure: ' + (process.env.SMTP_SECURE || 'false'));
         }
         
         // Log the reset URL prominently for manual retrieval if email fails
