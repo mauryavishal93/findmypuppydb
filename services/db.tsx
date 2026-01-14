@@ -1,15 +1,16 @@
-
 // ------------------------------------------------------------------
 // AUTH SERVICE - Client Side
 // ------------------------------------------------------------------
 
 // API Base URL Configuration:
-// Production backend server - all API calls will be made to this server
-// For local development/testing, you can temporarily change this to:
-// - Android Emulator: "http://10.0.2.2:5174" (10.0.2.2 is the Android emulator's alias for host machine's localhost)
-// - Physical Device: your computer's local IP address (e.g., "http://192.168.1.100:5174")
+// - For production: Use the production server URL
+// - For local development: Use empty string to leverage Vite proxy (recommended)
+//   OR use "http://localhost:5774" for direct backend connection
+// - For Android Emulator: "http://10.0.2.2:5774"
+// - For Physical Device: your computer's local IP (e.g., "http://192.168.1.100:5774")
+
+// Use production server for DB writes, or empty string to use Vite proxy in development
 export const API_BASE_URL = "https://findmypuppydb.onrender.com";
-//export const API_BASE_URL = "http://localhost:5274";
 
 export interface User {
   username: string;
@@ -108,6 +109,7 @@ export const db = {
       return { success: false, message: "Connection error." };
     }
   },
+
 
   updatePoints: async (username: string, points: number): Promise<{ success: boolean; message?: string; points?: number }> => {
     try {
@@ -278,5 +280,135 @@ export const db = {
       console.error("DB Google Sign In Error:", error);
       return { success: false, message: "Connection error. Check your internet." };
     }
-  }
+  },
+
+  forgotPassword: async (email: string): Promise<{ success: boolean; message?: string }> => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/auth/forgot-password`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ email }),
+      });
+
+      const data = await response.json();
+      if (!response.ok) {
+        return { success: false, message: data.message || "Failed to send password reset email" };
+      }
+      return data;
+    } catch (error) {
+      console.error("DB Forgot Password Error:", error);
+      return { success: false, message: "Connection error. Check your internet." };
+    }
+  },
+
+  resetPassword: async (token: string, newPassword: string): Promise<{ success: boolean; message?: string }> => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/auth/reset-password`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ token, newPassword }),
+      });
+
+      const data = await response.json();
+      if (!response.ok) {
+        return { success: false, message: data.message || "Failed to reset password" };
+      }
+      return data;
+    } catch (error) {
+      console.error("DB Reset Password Error:", error);
+      return { success: false, message: "Connection error. Check your internet." };
+    }
+  },
+
+  getDailyCheckInStatus: async (username: string): Promise<{
+    success: boolean;
+    message?: string;
+    lastCheckInDate?: string | null;
+    checkInStreak?: number;
+    totalCheckIns?: number;
+    hasCheckedInToday?: boolean;
+    puppyAge?: number;
+    puppySize?: number;
+  }> => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/daily-checkin/status/${username}`, {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      });
+
+      const data = await response.json();
+      if (!response.ok) {
+        return { success: false, message: data.message || "Failed to get daily check-in status" };
+      }
+      return data;
+    } catch (error) {
+      console.error("DB Get Daily Check-In Status Error:", error);
+      return { success: false, message: "Connection error. Check your internet." };
+    }
+  },
+
+  completeDailyCheckIn: async (
+    username: string
+  ): Promise<{
+    success: boolean;
+    message?: string;
+    hintsEarned?: number;
+    pointsEarned?: number;
+    totalHints?: number;
+    totalPoints?: number;
+    puppyAge?: number;
+    puppySize?: number;
+    checkInStreak?: number;
+    milestone?: '7days' | '30days' | '1year' | null;
+  }> => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/daily-checkin/complete`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ username }),
+      });
+
+      const data = await response.json();
+      if (!response.ok) {
+        return { success: false, message: data.message || "Failed to complete daily check-in" };
+      }
+      return data;
+    } catch (error) {
+      console.error("DB Complete Daily Check-In Error:", error);
+      return { success: false, message: "Connection error. Check your internet." };
+    }
+  },
+
+  getLeaderboard: async (): Promise<{
+    success: boolean;
+    message?: string;
+    leaderboard?: Array<{ username: string; rank: number; points: number }>;
+  }> => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/leaderboard`, {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      });
+
+      const data = await response.json();
+      if (!response.ok) {
+        return { success: false, message: data.message || "Failed to fetch leaderboard" };
+      }
+      return data;
+    } catch (error) {
+      console.error("DB Get Leaderboard Error:", error);
+      return { success: false, message: "Connection error. Check your internet." };
+    }
+  },
+
 };
