@@ -1913,22 +1913,57 @@ app.get('/api/purchase-history/:username', async (req, res) => {
 // Leaderboard endpoint - Get top 10 users by points (excluding zero points)
 app.get('/api/leaderboard', async (req, res) => {
   try {
-    const topUsers = await User.find({ points: { $gt: 0 } })
+    const { username } = req.query; // Get current username from query params
+    
+    // Get all users with points > 0, sorted by points descending (for top 10)
+    const usersWithPoints = await User.find({ points: { $gt: 0 } })
       .select('username points')
-      .sort({ points: -1 }) // Sort by points descending
-      .limit(10) // Top 10 only
+      .sort({ points: -1 })
       .lean();
 
-    // Add rank to each user
+    // Get top 10 users
+    const topUsers = usersWithPoints.slice(0, 10);
+
+    // Add rank to each user in top 10
     const leaderboard = topUsers.map((user, index) => ({
       username: user.username,
       rank: index + 1,
       points: user.points || 0
     }));
 
+    // If username is provided, find their rank and data
+    let currentUserRank = null;
+    if (username) {
+      // Find current user in the database (including those with 0 points)
+      const currentUserDoc = await User.findOne({ username: username.trim() })
+        .select('username points')
+        .lean();
+      
+      if (currentUserDoc) {
+        const currentUserPoints = currentUserDoc.points || 0;
+        
+        // Check if current user is in top 10
+        const isInTop10 = topUsers.some(user => user.username === currentUserDoc.username);
+        
+        // Only include current user if they're NOT in top 10
+        if (!isInTop10) {
+          // Calculate their rank: count how many users have more points
+          const usersAbove = usersWithPoints.filter(user => user.points > currentUserPoints).length;
+          const rank = usersAbove + 1; // Rank is 1-based
+          
+          currentUserRank = {
+            username: currentUserDoc.username,
+            rank: rank,
+            points: currentUserPoints
+          };
+        }
+      }
+    }
+
     res.json({
       success: true,
-      leaderboard: leaderboard
+      leaderboard: leaderboard,
+      currentUser: currentUserRank // Will be null if user is in top 10 or not found
     });
   } catch (error) {
     console.error('Error fetching leaderboard:', error);

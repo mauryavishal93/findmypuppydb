@@ -387,13 +387,19 @@ export const db = {
     }
   },
 
-  getLeaderboard: async (): Promise<{
+  getLeaderboard: async (currentUsername?: string): Promise<{
     success: boolean;
     message?: string;
     leaderboard?: Array<{ username: string; rank: number; points: number }>;
+    currentUser?: { username: string; rank: number; points: number } | null;
   }> => {
     try {
-      const response = await fetch(`${API_BASE_URL}/api/leaderboard`, {
+      // Add username as query parameter if provided
+      const url = currentUsername 
+        ? `${API_BASE_URL}/api/leaderboard?username=${encodeURIComponent(currentUsername)}`
+        : `${API_BASE_URL}/api/leaderboard`;
+      
+      const response = await fetch(url, {
         method: 'GET',
         headers: {
           'Content-Type': 'application/json',
@@ -410,5 +416,4 @@ export const db = {
       return { success: false, message: "Connection error. Check your internet." };
     }
   },
-
 };
