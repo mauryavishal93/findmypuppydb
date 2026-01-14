@@ -95,12 +95,12 @@ const userSchema = new mongoose.Schema({
   referredBy: { type: String, default: "" }, // Referral code used during signup (empty string instead of null)
   resetPasswordToken: { type: String, default: null }, // Password reset token
   resetPasswordExpires: { type: Date, default: null }, // Token expiration date
-  // Daily Check-In fields
-  lastPlayedDate: { type: String, default: null }, // Last date daily check-in was played (YYYY-MM-DD format)
-  currentMissionDay: { type: Number, default: 1 }, // Current mission day (1-10, then cycles)
-  hintStreak: { type: Number, default: 0 }, // Current daily hint streak
-  lastGamePlayedDate: { type: String, default: null }, // Last date a game was played (YYYY-MM-DD format)
-  dailyGameHints: { type: Number, default: 0 }, // Hints available for daily game (5 hints per day)
+  // Daily Check-In / Puppy Growth fields
+  lastCheckInDate: { type: String, default: null }, // Last date daily check-in was completed (YYYY-MM-DD format)
+  checkInStreak: { type: Number, default: 0 }, // Current consecutive days streak
+  totalCheckIns: { type: Number, default: 0 }, // Total number of check-ins
+  puppyAge: { type: Number, default: 0 }, // Puppy age in days (0-7, then cycles)
+  puppySize: { type: Number, default: 1 }, // Puppy size multiplier (1.0 to 2.0 based on age)
   createdAt: { type: Date, default: Date.now },
   lastLogin: { type: Date, default: Date.now }
 }, { collection: COLLECTION_NAME });
@@ -286,10 +286,7 @@ app.post('/api/login', async (req, res) => {
         levelPassedEasy: user.levelPassedEasy || 0,
         levelPassedMedium: user.levelPassedMedium || 0,
         levelPassedHard: user.levelPassedHard || 0,
-        referredBy: user.referredBy || "",
-        lastPlayedDate: user.lastPlayedDate || null,
-        currentMissionDay: user.currentMissionDay || 1,
-        hintStreak: user.hintStreak || 0
+        referredBy: user.referredBy || ""
       } 
     });
   } catch (error) {
@@ -1356,10 +1353,7 @@ app.post('/api/auth/google/signin', async (req, res) => {
           levelPassedEasy: user.levelPassedEasy || 0,
           levelPassedMedium: user.levelPassedMedium || 0,
           levelPassedHard: user.levelPassedHard || 0,
-          referredBy: user.referredBy || "",
-          lastPlayedDate: user.lastPlayedDate || null,
-          currentMissionDay: user.currentMissionDay || 1,
-          hintStreak: user.hintStreak || 0
+          referredBy: user.referredBy || ""
         }
       });
     }
@@ -1380,10 +1374,7 @@ app.post('/api/auth/google/signin', async (req, res) => {
         levelPassedEasy: user.levelPassedEasy || 0,
         levelPassedMedium: user.levelPassedMedium || 0,
         levelPassedHard: user.levelPassedHard || 0,
-        referredBy: user.referredBy || "",
-        lastPlayedDate: user.lastPlayedDate || null,
-        currentMissionDay: user.currentMissionDay || 1,
-        hintStreak: user.hintStreak || 0
+        referredBy: user.referredBy || ""
       }
     });
   } catch (error) {
@@ -1428,57 +1419,32 @@ app.post('/api/user/update-hints', async (req, res) => {
   }
 });
 
-// Update Hint Streak (for daily check-in hints)
-app.post('/api/user/update-hint-streak', async (req, res) => {
-  try {
-    const { username, hintStreak } = req.body;
-
-    if (!username || hintStreak === undefined) {
-      return res.status(400).json({ success: false, message: "Username and hintStreak are required." });
-    }
-
-    const user = await User.findOne({ username });
-    if (!user) {
-      return res.status(404).json({ success: false, message: "User not found." });
-    }
-
-    user.hintStreak = Math.max(0, hintStreak); // Ensure non-negative
-    await user.save();
-
-    res.status(200).json({ 
-      success: true, 
-      message: "Hint streak updated successfully!", 
-      hintStreak: user.hintStreak 
-    });
-  } catch (error) {
-    console.error('Update Hint Streak Error:', error);
-    res.status(500).json({ success: false, message: "Server error updating hint streak." });
-  }
-});
-
-// Get Daily Check-In Status
+// Get Daily Check-In Status (Puppy Growth)
 app.get('/api/daily-checkin/status/:username', async (req, res) => {
   try {
     const { username } = req.params;
-    
     const user = await User.findOne({ username });
     if (!user) {
       return res.status(404).json({ success: false, message: "User not found." });
     }
 
-    // Get today's date string (YYYY-MM-DD)
     const today = new Date();
     const todayString = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
-    
+    const hasCheckedInToday = user.lastCheckInDate === todayString;
+
+    // Calculate puppy age and size based on streak
+    const puppyAge = Math.min(user.checkInStreak || 0, 7); // Age 0-7 days
+    const puppySize = 1.0 + (puppyAge * 0.14); // Size grows from 1.0 to ~2.0 over 7 days
+
     res.status(200).json({
       success: true,
-      lastPlayedDate: user.lastPlayedDate || null,
-      currentMissionDay: user.currentMissionDay || 1,
-      hintStreak: user.hintStreak || 0,
-      totalHints: user.hints || 0,
-      lastGamePlayedDate: user.lastGamePlayedDate || null,
-      dailyGameHints: user.dailyGameHints || 0,
-      today: todayString
+      lastCheckInDate: user.lastCheckInDate || null,
+      checkInStreak: user.checkInStreak || 0,
+      totalCheckIns: user.totalCheckIns || 0,
+      hasCheckedInToday,
+      today: todayString,
+      puppyAge,
+      puppySize
     });
   } catch (error) {
     console.error('Get Daily Check-In Status Error:', error);
@@ -1486,51 +1452,7 @@ app.get('/api/daily-checkin/status/:username', async (req, res) => {
   }
 });
 
-// Mark Daily Check-In as Started (marks as played, prevents retry)
-app.post('/api/daily-checkin/start', async (req, res) => {
-  try {
-    const { username } = req.body;
-    
-    if (!username) {
-      return res.status(400).json({ success: false, message: "Username is required." });
-    }
-
-    const user = await User.findOne({ username });
-    if (!user) {
-      return res.status(404).json({ success: false, message: "User not found." });
-    }
-
-    // Get today's date string (YYYY-MM-DD)
-    const today = new Date();
-    const todayString = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
-    
-    // Check if already played today
-    if (user.lastPlayedDate === todayString) {
-      return res.status(400).json({ 
-        success: false, 
-        message: "Daily check-in already started today." 
-      });
-    }
-
-    // Mark as played (one chance per day)
-    user.lastPlayedDate = todayString;
-    // Also mark game as played (1 game per day limit)
-    user.lastGamePlayedDate = todayString;
-    await user.save();
-
-    res.status(200).json({
-      success: true,
-      message: "Daily check-in started.",
-      lastPlayedDate: user.lastPlayedDate,
-      lastGamePlayedDate: user.lastGamePlayedDate
-    });
-  } catch (error) {
-    console.error('Mark Daily Check-In Started Error:', error);
-    res.status(500).json({ success: false, message: "Server error marking daily check-in as started." });
-  }
-});
-
-// Complete Daily Check-In Mission (only gives hints if successful)
+// Feed Puppy / Complete Daily Check-In
 app.post('/api/daily-checkin/complete', async (req, res) => {
   try {
     const { username } = req.body;
@@ -1544,66 +1466,98 @@ app.post('/api/daily-checkin/complete', async (req, res) => {
       return res.status(404).json({ success: false, message: "User not found." });
     }
 
-    // Get today's date string (YYYY-MM-DD)
     const today = new Date();
     const todayString = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
     
-    // IMPORTANT: Check if already completed today - prevent duplicate completions
-    // Check if lastPlayedDate is today AND if we've already given hints today
-    if (user.lastPlayedDate === todayString && user.dailyGameHints === 5) {
-      // Already completed today - return without adding hints again
+    // Check if already completed today
+    if (user.lastCheckInDate === todayString) {
+      const puppyAge = Math.min(user.checkInStreak || 0, 7);
+      const puppySize = 1.0 + (puppyAge * 0.14);
       return res.status(200).json({
         success: true,
-        message: "Daily check-in already completed today.",
-        lastPlayedDate: user.lastPlayedDate,
-        currentMissionDay: user.currentMissionDay,
-        hintStreak: user.hintStreak,
-        totalHints: user.hints,
-        hintsEarned: 0 // No new hints earned
+        message: "Puppy already fed today!",
+        lastCheckInDate: user.lastCheckInDate,
+        checkInStreak: user.checkInStreak,
+        puppyAge,
+        puppySize,
+        hintsEarned: 0,
+        pointsEarned: 0,
+        totalHints: user.hints || 0,
+        totalPoints: user.points || 0
       });
     }
-    
-    // Check if already played today (should be marked when game started)
-    // But allow completion even if not started (for failure cases)
-    if (user.lastPlayedDate !== todayString) {
-      // If not started, mark as started now (for failure case)
-      user.lastPlayedDate = todayString;
-      user.lastGamePlayedDate = todayString;
-    }
 
-    // Always give 5 hints for daily game (success or failure) - but only once per day
-    // Check if streak should reset (more than 1 day ago)
-    let newHintStreak = user.hintStreak || 0;
-    if (user.lastPlayedDate && user.lastPlayedDate !== todayString) {
-      const lastPlayed = new Date(user.lastPlayedDate);
-      const daysDiff = (today.getTime() - lastPlayed.getTime()) / (1000 * 60 * 60 * 24);
-      if (daysDiff > 1) {
-        newHintStreak = 0; // Reset streak if missed a day
+    // Calculate streak
+    let newStreak = 1;
+    if (user.lastCheckInDate) {
+      const lastCheckIn = new Date(user.lastCheckInDate);
+      const daysDiff = Math.floor((today.getTime() - lastCheckIn.getTime()) / (1000 * 60 * 60 * 24));
+      if (daysDiff === 1) {
+        // Consecutive day - increment streak
+        newStreak = (user.checkInStreak || 0) + 1;
+      } else if (daysDiff > 1) {
+        // Missed a day - reset streak and puppy age
+        newStreak = 1;
       }
     }
 
-    // Update user data - only if not already completed today
-    // IMPORTANT: Only add to streak, NOT to total hints
-    user.lastPlayedDate = todayString;
-    user.currentMissionDay = (user.currentMissionDay || 1) + 1;
-    if (user.currentMissionDay > 10) {
-      user.currentMissionDay = 1; // Cycle back to day 1 after day 10
+    // Calculate puppy age (0-7 days, cycles)
+    const puppyAge = Math.min(newStreak, 7);
+    const puppySize = 1.0 + (puppyAge * 0.14); // Size grows from 1.0 to ~2.0 over 7 days
+
+    // Calculate rewards based on streak milestones (only on milestone day)
+    let hintsEarned = 0;
+    let pointsEarned = 0;
+    let milestone = null;
+    
+    // 7 days streak = 10 hints (only on day 7)
+    if (newStreak === 7) {
+      hintsEarned = 10;
+      milestone = '7days';
     }
-    user.hintStreak = newHintStreak + 5; // Add 5 hints to streak only
-    user.dailyGameHints = 5; // Give 5 hints for today's game (available for 1 game per day)
-    user.lastGamePlayedDate = todayString; // Mark game as played (1 game per day limit)
-    // DO NOT add to user.hints - daily hints are separate from total hints
+    // 30 days streak = 50 points (only on day 30)
+    else if (newStreak === 30) {
+      pointsEarned = 50;
+      milestone = '30days';
+    }
+    // 365 days (1 year) streak = 1000 hints (only on day 365)
+    else if (newStreak === 365) {
+      hintsEarned = 1000;
+      milestone = '1year';
+    }
+
+    // Update user data
+    user.lastCheckInDate = todayString;
+    user.checkInStreak = newStreak;
+    user.totalCheckIns = (user.totalCheckIns || 0) + 1;
+    user.puppyAge = puppyAge;
+    user.puppySize = puppySize;
+    
+    if (hintsEarned > 0) {
+      user.hints = (user.hints || 0) + hintsEarned;
+    }
+    if (pointsEarned > 0) {
+      user.points = (user.points || 0) + pointsEarned;
+    }
 
     await user.save();
 
     res.status(200).json({
       success: true,
-      message: "Daily check-in completed! +5 hints added to your streak!",
-      lastPlayedDate: user.lastPlayedDate,
-      currentMissionDay: user.currentMissionDay,
-      hintStreak: user.hintStreak,
-      totalHints: user.hints, // Total hints unchanged
-      hintsEarned: 5
+      message: hintsEarned > 0 
+        ? `Puppy fed! 🎉 +${hintsEarned} hints earned!`
+        : pointsEarned > 0
+        ? `Puppy fed! 🎉 +${pointsEarned} points earned!`
+        : "Puppy fed! 🐕",
+      lastCheckInDate: user.lastCheckInDate,
+      checkInStreak: user.checkInStreak,
+      puppyAge,
+      puppySize,
+      hintsEarned,
+      pointsEarned,
+      totalHints: user.hints || 0,
+      totalPoints: user.points || 0,
+      milestone: newStreak === 7 ? '7days' : newStreak === 30 ? '30days' : newStreak === 365 ? '1year' : null
     });
   } catch (error) {
     console.error('Complete Daily Check-In Error:', error);
@@ -1956,7 +1910,35 @@ app.get('/api/purchase-history/:username', async (req, res) => {
   }
 });
 
-// Get User Data Endpoint
+// Leaderboard endpoint - Get top 10 users by points (excluding zero points)
+app.get('/api/leaderboard', async (req, res) => {
+  try {
+    const topUsers = await User.find({ points: { $gt: 0 } })
+      .select('username points')
+      .sort({ points: -1 }) // Sort by points descending
+      .limit(10) // Top 10 only
+      .lean();
+
+    // Add rank to each user
+    const leaderboard = topUsers.map((user, index) => ({
+      username: user.username,
+      rank: index + 1,
+      points: user.points || 0
+    }));
+
+    res.json({
+      success: true,
+      leaderboard: leaderboard
+    });
+  } catch (error) {
+    console.error('Error fetching leaderboard:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch leaderboard'
+    });
+  }
+});
+
 app.get('/api/user/:username', async (req, res) => {
   try {
     const { username } = req.params;
@@ -1990,10 +1972,7 @@ app.get('/api/user/:username', async (req, res) => {
         levelPassedEasy: user.levelPassedEasy || 0,
         levelPassedMedium: user.levelPassedMedium || 0,
         levelPassedHard: user.levelPassedHard || 0,
-        referredBy: user.referredBy || "",
-        hintStreak: user.hintStreak || 0, // IMPORTANT: Return hintStreak for use as dailyStreakHints
-        lastPlayedDate: user.lastPlayedDate || null,
-        currentMissionDay: user.currentMissionDay || 1
+        referredBy: user.referredBy || ""
       } 
     });
   } catch (error) {
