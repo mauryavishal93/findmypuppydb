@@ -12,14 +12,17 @@ import crypto from 'crypto';
 import fs from 'fs';
 import { OAuth2Client } from 'google-auth-library';
 import nodemailer from 'nodemailer';
+import adminRouter from './admin/routes/index.js';
+import { seedFirstAdmin } from './admin/seed.js';
+import { GameConfig, MaintenanceMode } from './admin/schemas.js';
 
-// Load environment variables from .env file (look in parent directory since server.js is in server folder)
+// Load environment variables (Render injects process.env; local can use .env files)
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 dotenv.config({ path: join(__dirname, '..', '.env') });
-
-// Also try loading from current directory as fallback
-dotenv.config();
+dotenv.config({ path: join(__dirname, '.env') }); // server/.env
+dotenv.config({ path: join(__dirname, '.env.local') }); // server/.env.local (local overrides)
+dotenv.config(); // process.cwd() .env
 
 const app = express();
 // Professional SRE Rule: Always allow the environment to override the PORT
@@ -36,8 +39,8 @@ const razorpay = new Razorpay({
 
 console.log(`💳 Razorpay Initialized with Key ID: ${RAZORPAY_KEY_ID.substring(0, 8)}...`);
 
-// Google OAuth Configuration
-const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
+// Google OAuth Configuration (use same client ID as frontend; Render may set VITE_GOOGLE_CLIENT_ID only)
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || process.env.VITE_GOOGLE_CLIENT_ID || '';
 const googleClient = GOOGLE_CLIENT_ID ? new OAuth2Client(GOOGLE_CLIENT_ID) : null;
 
 if (googleClient) {
@@ -49,6 +52,15 @@ if (googleClient) {
 // Middleware
 app.use(cors());
 app.use(express.json());
+
+// Allow Google Sign-In / OAuth popups to use postMessage (fixes "COOP would block window.postMessage" on Render)
+app.use((_req, res, next) => {
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
+  next();
+});
+
+// Admin Panel API (RBAC-protected; separate auth from player auth)
+app.use('/api/admin', adminRouter);
 
 // Serve static files from the 'dist' directory in production
 const isProduction = process.env.NODE_ENV === 'production' || process.env.RENDER === 'true';
@@ -71,8 +83,8 @@ if (isProduction) {
   console.log('🚀 Running in DEVELOPMENT mode.');
 }
 
-// MongoDB Connection
-const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://vimaurya24_db_user:jrPF6GqaTX9H40s1@findmypuppy.q6hlrak.mongodb.net/findmypuppy?appName=findmypuppy";
+// MongoDB Connection (Render uses MONGODB_URI; support both)
+const MONGO_URI = process.env.MONGO_URI || process.env.MONGODB_URI || "mongodb+srv://vimaurya24_db_user:jrPF6GqaTX9H40s1@findmypuppy.q6hlrak.mongodb.net/findmypuppy?appName=findmypuppy";
 const COLLECTION_NAME = "user"; 
 
 mongoose.connect(MONGO_URI)
@@ -102,7 +114,12 @@ const userSchema = new mongoose.Schema({
   puppyAge: { type: Number, default: 0 }, // Puppy age in days (0-7, then cycles)
   puppySize: { type: Number, default: 1 }, // Puppy size multiplier (1.0 to 2.0 based on age)
   createdAt: { type: Date, default: Date.now },
-  lastLogin: { type: Date, default: Date.now }
+  lastLogin: { type: Date, default: Date.now },
+  // Admin: ban
+  banned: { type: Boolean, default: false },
+  bannedAt: { type: Date },
+  bannedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'AdminUser' },
+  banReason: { type: String },
 }, { collection: COLLECTION_NAME });
 
 // Ensure strict is false for this model just in case
@@ -174,7 +191,8 @@ const initializePriceOffer = async () => {
 // Run initialization after mongoose connection is established
 mongoose.connection.once('open', async () => {
   initializePriceOffer();
-  
+  seedFirstAdmin().catch((err) => console.error('Admin seed error:', err));
+
   // Migration: Ensure all existing users have the 'referredBy' field
   try {
     // 1. Add referredBy only where it is missing, null, or empty
@@ -249,6 +267,10 @@ app.post('/api/login', async (req, res) => {
     
     if (!user) {
       return res.status(404).json({ success: false, message: "User not found. Please sign up." });
+    }
+
+    if (user.banned) {
+      return res.status(403).json({ success: false, message: "This account has been banned." });
     }
 
     // Skip password check for OAuth users
@@ -443,13 +465,28 @@ app.post('/api/signup', async (req, res) => {
   }
 });
 
+// Normalize env value: trim, remove surrounding quotes, remove internal spaces (Gmail App Password is 16 chars)
+function normalizeEnvValue(val) {
+  if (val == null || typeof val !== 'string') return '';
+  let s = val.trim();
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+    s = s.slice(1, -1).trim();
+  }
+  return s;
+}
+
+// Gmail App Password is 16 chars; Google shows it as "xxxx xxxx xxxx xxxx" - strip spaces for SMTP
+function normalizeAppPassword(val) {
+  const s = normalizeEnvValue(val);
+  return s.replace(/\s+/g, '');
+}
+
 // Email Configuration for Password Reset (moved up for better organization)
 const createTransporter = () => {
   // Use environment variables for email configuration
-  // For Gmail: Use App Password (not regular password)
-  // Important: Trim whitespace from credentials as they often have trailing spaces
-  const smtpUser = (process.env.SMTP_USER || process.env.EMAIL_USER || '').trim();
-  const smtpPass = (process.env.SMTP_PASS || process.env.EMAIL_PASS || '').trim();
+  // For Gmail: Use App Password (not regular password) - see https://myaccount.google.com/apppasswords
+  const smtpUser = normalizeEnvValue(process.env.SMTP_USER || process.env.EMAIL_USER || '');
+  const smtpPass = normalizeAppPassword(process.env.SMTP_PASS || process.env.EMAIL_PASS || '');
   
   // Get SMTP settings
   // For production/Render: Try port 465 with SSL first (more reliable than 587)
@@ -477,12 +514,9 @@ const createTransporter = () => {
         user: smtpUser,
         pass: smtpPass
       },
-      // Gmail App Passwords: Standard configuration
+      // Gmail App Passwords: Standard configuration (use Node default TLS, avoid deprecated SSLv3)
       tls: {
-        rejectUnauthorized: false, // Allow self-signed certificates (useful for development)
-        // Additional TLS options for production
-        ciphers: 'SSLv3',
-        minVersion: 'TLSv1'
+        rejectUnauthorized: false // Allow self-signed certs in development
       },
       // Connection timeout settings for Render/production environments
       // Longer timeouts for production to handle Gmail SMTP slowness on cloud platforms
@@ -527,50 +561,30 @@ const createTransporter = () => {
 
     const transporter = nodemailer.createTransport(emailConfig);
     
-    // Skip verification if SKIP_EMAIL_VERIFY is set (useful for production when Gmail blocks connections)
-    const skipVerification = process.env.SKIP_EMAIL_VERIFY === 'true' || 
+    // Skip verification in development or when requested (avoids 535 on startup; send is still attempted)
+    const isDev = process.env.NODE_ENV !== 'production' && process.env.RENDER !== 'true';
+    const skipVerification = process.env.SKIP_EMAIL_VERIFY === 'true' ||
+                              isDev ||
                               (process.env.RENDER === 'true' && process.env.SKIP_EMAIL_VERIFY !== 'false');
     
     if (skipVerification) {
-      console.log('⚠️  Email verification skipped (SKIP_EMAIL_VERIFY=true or Render detected)');
-      console.log('   Email transporter created. Verification will happen on first email send.');
-      console.log('   This is recommended when Gmail SMTP blocks connections from cloud platforms.');
+      console.log('📧 Email transporter created (verification skipped).');
+      if (isDev) {
+        console.log('   For password-reset emails: use Gmail App Password in .env — see PASSWORD_RESET_SETUP.md');
+      }
     } else {
       // Verify transporter connection on startup (non-blocking with timeout)
-      // Note: Verification failure won't prevent emails from being sent
       const verifyTimeout = setTimeout(() => {
-        console.warn('⏱️  Email verification is taking too long, skipping...');
-        console.warn('   Email transporter created. Verification will happen on first email send.');
-        console.warn('   If this happens frequently, set SKIP_EMAIL_VERIFY=true in environment variables.');
-      }, 10000); // 10 second timeout for verification
+        console.warn('⏱️  Email verification timeout; transporter ready for first send.');
+      }, 10000);
       
       transporter.verify((error, success) => {
         clearTimeout(verifyTimeout);
         if (error) {
-          console.error('❌ Email service verification failed:');
-          console.error(`   Error: ${error.message}`);
-          if (error.responseCode === 535 || error.responseCode === '535') {
-            console.error('   🔐 Authentication Error:');
-            console.error('      - Make sure you are using an App Password (not your regular Gmail password)');
-            console.error('      - Ensure 2-Factor Authentication is enabled on your Google account');
-            console.error('      - Generate a new App Password at: https://myaccount.google.com/apppasswords');
-            console.error('      - Check that SMTP_USER and SMTP_PASS environment variables are set correctly');
-            console.error('      - Verify the password has no extra spaces (it should be trimmed automatically)');
-          } else if (error.message && error.message.includes('timeout')) {
-            console.error('   ⏱️  Connection Timeout:');
-            console.error('      - Gmail SMTP may be blocking connections from this IP address');
-            console.error('      - This is common on cloud platforms like Render');
-            console.error('      - Set SKIP_EMAIL_VERIFY=true to skip verification (emails will still work)');
-          } else {
-            console.error('   Please check your SMTP credentials in environment variables.');
+          console.warn('⚠️  Email verification failed (transporter still used for sends):', error.message?.split('\n')[0] || error.message);
+          if (error.responseCode === 535) {
+            console.warn('   Use Gmail App Password in .env — see PASSWORD_RESET_SETUP.md');
           }
-          if (error.command) {
-            console.error(`   Command: ${error.command}`);
-          }
-          if (error.response) {
-            console.error(`   Response: ${error.response}`);
-          }
-          console.warn('⚠️  Email transporter created but verification failed. Emails may still work, but please verify your credentials.');
         } else {
           console.log('✅ Email service verified and ready');
           console.log(`   SMTP Host: ${smtpHost}:${smtpPort}`);
@@ -732,7 +746,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
       return res.status(500).json(errorResponse);
     }
 
-    const fromEmail = (process.env.SMTP_USER || process.env.EMAIL_USER || '').trim();
+    const fromEmail = normalizeEnvValue(process.env.SMTP_USER || process.env.EMAIL_USER || '');
     
     // Validate email configuration before sending
     if (!fromEmail) {
@@ -903,9 +917,7 @@ Find My Puppy | Where Adventure Meets Fun 🎮
         `
       };
 
-      // Send email asynchronously (non-blocking) to prevent request timeout
-      // This allows password reset to work even if email service is unavailable
-      // IMPORTANT: Email is sent in background - response is sent immediately to user
+      // Send email and await so we only return success when the user's inbox receives the link
       const sendEmailAsync = async () => {
         const isProduction = process.env.RENDER === 'true' || process.env.NODE_ENV === 'production';
         // Use longer timeout for production to handle Gmail SMTP slowness on cloud platforms
@@ -930,7 +942,7 @@ Find My Puppy | Where Adventure Meets Fun 🎮
                     secure: true, // Required for port 465
                     auth: {
                       user: fromEmail,
-                      pass: (process.env.SMTP_PASS || process.env.EMAIL_PASS || '').trim()
+                      pass: normalizeAppPassword(process.env.SMTP_PASS || process.env.EMAIL_PASS || '')
                     },
                     tls: {
                       rejectUnauthorized: false
@@ -1077,28 +1089,19 @@ Find My Puppy | Where Adventure Meets Fun 🎮
         console.error(`🔗 [FORGOT-PASSWORD] IMPORTANT: Reset URL (use this if email fails):`);
         console.error(`   ${resetUrl}`);
         console.error('❌ ===========================================\n');
-        
-        // Don't throw - just log the error since email is sent asynchronously
-        // The reset token is already saved, so password reset will still work
-        console.error('   ⚠️  Email failed but reset token is valid. User can still reset password using the link above.');
+        throw emailError;
         }
       };
 
-      // Start email sending asynchronously (don't await - fire and forget)
-      // This prevents blocking the response even if email service is slow/unavailable
-      sendEmailAsync().catch(err => {
-        console.error('[FORGOT-PASSWORD] Unhandled error in async email send:', err);
-      });
+      // Await email send so we only return success when the registered email receives the link
+      await sendEmailAsync();
 
-      // Always return success to user (security best practice - don't reveal if email was sent)
-      // The reset token is saved in the database, so password reset will work
-      // If email fails, the reset URL is logged in server logs for manual retrieval
-      console.log(`✅ [FORGOT-PASSWORD] Password reset token generated and saved for ${user.email}`);
-      console.log(`🔗 [FORGOT-PASSWORD] Reset URL (also in logs): ${resetUrl}`);
+      console.log(`✅ [FORGOT-PASSWORD] Password reset email sent to ${user.email}`);
+      console.log(`🔗 [FORGOT-PASSWORD] Reset URL: ${resetUrl}`);
       
       res.status(200).json({ 
         success: true, 
-        message: "If an account with that email exists, a password reset link has been sent." 
+        message: "A password reset link has been sent to your email address. Please check your inbox." 
       });
   } catch (error) {
     console.error('\n❌ ========== FORGOT PASSWORD ENDPOINT ERROR ==========');
@@ -1125,10 +1128,17 @@ Find My Puppy | Where Adventure Meets Fun 🎮
     
     console.error('❌ ===================================================\n');
     
-    // Return detailed error in development, generic in production
+    // User-friendly message when email send failed so they know to try again or check config
+    const isEmailSendError = error.code === 'EAUTH' || error.code === 'ETIMEDOUT' || 
+      error.code === 'ECONNECTION' || error.code === 'ESOCKET' ||
+      (error.message && (error.message.includes('Email') || error.message.includes('timeout') || error.message.includes('SMTP')));
+    const userMessage = isEmailSendError
+      ? "We couldn't send the reset email. Please try again in a few minutes or contact support."
+      : "Server error processing password reset request.";
+    
     res.status(500).json({ 
       success: false, 
-      message: "Server error processing password reset request.",
+      message: userMessage,
       ...(process.env.NODE_ENV !== 'production' && {
         error: error.message,
         errorType: error.constructor.name
@@ -1240,7 +1250,11 @@ app.post('/api/auth/google/signin', async (req, res) => {
     }
 
     if (!googleClient) {
-      return res.status(500).json({ success: false, message: "Google OAuth not configured on server." });
+      console.error('Google sign-in attempted but GOOGLE_CLIENT_ID is not set (e.g. on Render set it in Environment).');
+      return res.status(503).json({
+        success: false,
+        message: "Google sign-in is not configured on this server. Set GOOGLE_CLIENT_ID in the server environment (e.g. Render dashboard)."
+      });
     }
 
     // Verify the Google ID token
@@ -1259,13 +1273,36 @@ app.post('/api/auth/google/signin', async (req, res) => {
     // Check if user exists with this Google ID
     let user = await User.findOne({ googleId });
 
+    if (user && user.banned) {
+      return res.status(403).json({ success: false, message: "This account has been banned." });
+    }
+
     if (!user) {
-      // User doesn't exist - check if email exists (might be a different auth method)
+      // User doesn't exist by googleId - check if email exists (e.g. signed up with email/password)
       const existingUser = await User.findOne({ email });
       if (existingUser) {
-        return res.status(409).json({ 
-          success: false, 
-          message: "An account with this email already exists. Please use the regular login." 
+        if (existingUser.banned) {
+          return res.status(403).json({ success: false, message: "This account has been banned." });
+        }
+        // Link Google to existing account: same user can sign in with password or Google
+        existingUser.googleId = googleId;
+        existingUser.lastLogin = new Date();
+        await existingUser.save();
+
+        return res.status(200).json({
+          success: true,
+          message: "Account linked! You can now sign in with Google or password.",
+          user: {
+            username: existingUser.username,
+            email: existingUser.email,
+            hints: existingUser.hints || 0,
+            points: existingUser.points || 0,
+            premium: existingUser.premium || false,
+            levelPassedEasy: existingUser.levelPassedEasy || 0,
+            levelPassedMedium: existingUser.levelPassedMedium || 0,
+            levelPassedHard: existingUser.levelPassedHard || 0,
+            referredBy: existingUser.referredBy || ""
+          }
         });
       }
 
@@ -1379,7 +1416,11 @@ app.post('/api/auth/google/signin', async (req, res) => {
     });
   } catch (error) {
     console.error('Google OAuth Sign In Error:', error);
-    res.status(500).json({ success: false, message: "Server error during Google sign in." });
+    const isTokenError = error?.message?.includes('Token') || error?.message?.includes('audience') || error?.message?.includes('verify');
+    const message = isTokenError
+      ? "Invalid or expired Google sign-in. Try signing in again."
+      : "Server error during Google sign in. If this persists, check server logs and GOOGLE_CLIENT_ID.";
+    res.status(isTokenError ? 401 : 500).json({ success: false, message });
   }
 });
 
@@ -2016,6 +2057,78 @@ app.get('/api/user/:username', async (req, res) => {
   }
 });
 
+// Public game config (used by game client so admin changes reflect for all users)
+app.get('/api/game-config', async (req, res) => {
+  try {
+    const [maintenanceDoc, gameConfigDoc] = await Promise.all([
+      MaintenanceMode.findOne({ configKey: 'default' }).lean(),
+      GameConfig.findOne({ configKey: 'default' }).lean(),
+    ]);
+    if (maintenanceDoc && maintenanceDoc.enabled) {
+      return res.status(200).json({
+        success: true,
+        maintenance: {
+          enabled: true,
+          message: maintenanceDoc.message || 'Under maintenance. Please try again later.',
+        },
+        gameConfig: null,
+        priceOffer: null,
+      });
+    }
+    let gameConfig = gameConfigDoc;
+    if (!gameConfig) {
+      gameConfig = {
+        puppyCountEasy: 15,
+        puppyCountMedium: 25,
+        puppyCountHard: 40,
+        timerMediumSeconds: 150,
+        timerHardSeconds: 180,
+        wrongTapLimit: 3,
+        pointsPerLevelEasy: 5,
+        pointsPerLevelMedium: 10,
+        pointsPerLevelHard: 15,
+        levelsEnabled: true,
+        timerEnabled: true,
+      };
+    }
+    const offer = await PriceOffer.findOne({ hintPack: '100 Hints Pack' }).lean();
+    const priceOffer = offer ? {
+      hintPack: offer.hintPack,
+      marketPrice: offer.marketPrice,
+      offerPrice: offer.offerPrice,
+      hintCount: offer.hintCount,
+      offerReason: offer.offerReason || 'Special Offer',
+    } : {
+      hintPack: '100 Hints Pack',
+      marketPrice: 99,
+      offerPrice: 9,
+      hintCount: 100,
+      offerReason: 'Special Offer',
+    };
+    res.status(200).json({
+      success: true,
+      maintenance: { enabled: false, message: null },
+      gameConfig: {
+        puppyCountEasy: gameConfig.puppyCountEasy,
+        puppyCountMedium: gameConfig.puppyCountMedium,
+        puppyCountHard: gameConfig.puppyCountHard,
+        timerMediumSeconds: gameConfig.timerMediumSeconds,
+        timerHardSeconds: gameConfig.timerHardSeconds,
+        wrongTapLimit: gameConfig.wrongTapLimit,
+        pointsPerLevelEasy: gameConfig.pointsPerLevelEasy,
+        pointsPerLevelMedium: gameConfig.pointsPerLevelMedium,
+        pointsPerLevelHard: gameConfig.pointsPerLevelHard,
+        levelsEnabled: gameConfig.levelsEnabled !== false,
+        timerEnabled: gameConfig.timerEnabled !== false,
+      },
+      priceOffer,
+    });
+  } catch (error) {
+    console.error('Get game config error:', error);
+    res.status(500).json({ success: false, message: 'Server error fetching game config.' });
+  }
+});
+
 // Get Price Offer Endpoint
 app.get('/api/price-offer', async (req, res) => {
   try {
@@ -2322,8 +2435,11 @@ app.get('/privacy-policy.html', (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`🚀 Backend Server running on http://localhost:${PORT} (${isProduction ? 'PRODUCTION' : 'DEVELOPMENT'})`);
+// Try to listen on PORT; if EADDRINUSE, try next port (5775, 5776, ...) until one is free
+function startServer(tryPort) {
+  const server = app.listen(tryPort, () => {
+    const actualPort = server.address().port;
+    console.log(`🚀 Backend Server running on http://localhost:${actualPort} (${isProduction ? 'PRODUCTION' : 'DEVELOPMENT'})`);
   
   if (isProduction) {
     // In production, for any request that doesn't match a static file or API route,
@@ -2346,12 +2462,13 @@ app.listen(PORT, () => {
       }
     });
   } else {
-    // Start the frontend dev server ONLY in development
+    // Start the frontend dev server ONLY in development (pass backend port so proxy works if we fell back to 5775+)
     console.log('📦 Starting frontend dev server...');
     const viteProcess = spawn('npm', ['run', 'dev'], {
       cwd: join(__dirname, '..'),
       stdio: 'inherit',
-      shell: true
+      shell: true,
+      env: { ...process.env, VITE_API_PORT: String(actualPort) }
     });
   
   viteProcess.on('error', (error) => {
@@ -2377,4 +2494,17 @@ app.listen(PORT, () => {
     process.exit(0);
   });
   }
-});
+  });
+
+  server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      console.warn(`⚠️ Port ${tryPort} in use, trying ${tryPort + 1}...`);
+      startServer(tryPort + 1);
+    } else {
+      console.error('Server error:', err);
+      process.exit(1);
+    }
+  });
+}
+
+startServer(PORT);
