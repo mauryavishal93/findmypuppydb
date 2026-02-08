@@ -49,6 +49,12 @@ if (googleClient) {
   console.warn('⚠️ Google OAuth not configured. Set GOOGLE_CLIENT_ID environment variable.');
 }
 
+// Testing: allow multiple daily run completions per day (set ALLOW_MULTIPLE_DAILY_RUNS=true)
+const ALLOW_MULTIPLE_DAILY_RUNS = process.env.ALLOW_MULTIPLE_DAILY_RUNS === 'true';
+if (ALLOW_MULTIPLE_DAILY_RUNS) {
+  console.warn('⚠️ ALLOW_MULTIPLE_DAILY_RUNS is enabled — daily run can be completed multiple times per day (testing only).');
+}
+
 // Middleware
 app.use(cors());
 app.use(express.json());
@@ -113,6 +119,15 @@ const userSchema = new mongoose.Schema({
   totalCheckIns: { type: Number, default: 0 }, // Total number of check-ins
   puppyAge: { type: Number, default: 0 }, // Puppy age in days (0-7, then cycles)
   puppySize: { type: Number, default: 1 }, // Puppy size multiplier (1.0 to 2.0 based on age)
+  streakFreezeWeek: { type: String, default: null }, // ISO week "YYYY-Www" when user last used streak freeze
+  lastDailyPuzzleDate: { type: String, default: null }, // YYYY-MM-DD - last day user completed daily puzzle
+  puppyRunHighScore: { type: Number, default: 0 }, // Best score in Puppy Run game
+  lastPlayedAt: { type: Date, default: null }, // Last time user played a level (for comeback bonus)
+  comebackBonusClaimed: { type: Boolean, default: false }, // One-time bonus after 7+ days away
+  achievements: { type: [String], default: [] }, // Array of achievement IDs unlocked
+  weeklyChallengeWeek: { type: String, default: null }, // "YYYY-Www"
+  weeklyChallengeProgress: { type: mongoose.Schema.Types.Mixed, default: { easy: 0, medium: 0, hard: 0 } },
+  weeklyChallengeClaimed: { type: Boolean, default: false },
   createdAt: { type: Date, default: Date.now },
   lastLogin: { type: Date, default: Date.now },
   // Admin: ban
@@ -308,7 +323,8 @@ app.post('/api/login', async (req, res) => {
         levelPassedEasy: user.levelPassedEasy || 0,
         levelPassedMedium: user.levelPassedMedium || 0,
         levelPassedHard: user.levelPassedHard || 0,
-        referredBy: user.referredBy || ""
+        referredBy: user.referredBy || "",
+        puppyRunHighScore: user.puppyRunHighScore || 0
       } 
     });
   } catch (error) {
@@ -438,7 +454,8 @@ app.post('/api/signup', async (req, res) => {
       premium: verifiedUser.premium,
       levelPassedEasy: verifiedUser.levelPassedEasy,
       levelPassedMedium: verifiedUser.levelPassedMedium,
-      levelPassedHard: verifiedUser.levelPassedHard
+      levelPassedHard: verifiedUser.levelPassedHard,
+      puppyRunHighScore: verifiedUser.puppyRunHighScore || 0
     };
 
     console.log(`📤 SENDING SIGNUP RESPONSE:`, { 
@@ -1301,7 +1318,8 @@ app.post('/api/auth/google/signin', async (req, res) => {
             levelPassedEasy: existingUser.levelPassedEasy || 0,
             levelPassedMedium: existingUser.levelPassedMedium || 0,
             levelPassedHard: existingUser.levelPassedHard || 0,
-            referredBy: existingUser.referredBy || ""
+            referredBy: existingUser.referredBy || "",
+            puppyRunHighScore: existingUser.puppyRunHighScore || 0
           }
         });
       }
@@ -1390,7 +1408,8 @@ app.post('/api/auth/google/signin', async (req, res) => {
           levelPassedEasy: user.levelPassedEasy || 0,
           levelPassedMedium: user.levelPassedMedium || 0,
           levelPassedHard: user.levelPassedHard || 0,
-          referredBy: user.referredBy || ""
+          referredBy: user.referredBy || "",
+          puppyRunHighScore: user.puppyRunHighScore || 0
         }
       });
     }
@@ -1411,7 +1430,8 @@ app.post('/api/auth/google/signin', async (req, res) => {
         levelPassedEasy: user.levelPassedEasy || 0,
         levelPassedMedium: user.levelPassedMedium || 0,
         levelPassedHard: user.levelPassedHard || 0,
-        referredBy: user.referredBy || ""
+        referredBy: user.referredBy || "",
+        puppyRunHighScore: user.puppyRunHighScore || 0
       }
     });
   } catch (error) {
@@ -1477,6 +1497,17 @@ app.get('/api/daily-checkin/status/:username', async (req, res) => {
     const puppyAge = Math.min(user.checkInStreak || 0, 7); // Age 0-7 days
     const puppySize = 1.0 + (puppyAge * 0.14); // Size grows from 1.0 to ~2.0 over 7 days
 
+    const getISOWeek = (d) => {
+      const date = new Date(d);
+      date.setHours(0, 0, 0, 0);
+      date.setDate(date.getDate() + 4 - (date.getDay() || 7));
+      const yearStart = new Date(date.getFullYear(), 0, 1);
+      const weekNo = Math.ceil((((date - yearStart) / 86400000) + 1) / 7);
+      return `${date.getFullYear()}-W${String(weekNo).padStart(2, '0')}`;
+    };
+    const thisWeek = getISOWeek(today);
+    const hasUsedFreezeThisWeek = (user.streakFreezeWeek || '') === thisWeek;
+
     res.status(200).json({
       success: true,
       lastCheckInDate: user.lastCheckInDate || null,
@@ -1485,7 +1516,9 @@ app.get('/api/daily-checkin/status/:username', async (req, res) => {
       hasCheckedInToday,
       today: todayString,
       puppyAge,
-      puppySize
+      puppySize,
+      hasUsedFreezeThisWeek,
+      streakFreezeAvailable: !hasUsedFreezeThisWeek
     });
   } catch (error) {
     console.error('Get Daily Check-In Status Error:', error);
@@ -1528,16 +1561,37 @@ app.post('/api/daily-checkin/complete', async (req, res) => {
       });
     }
 
-    // Calculate streak
+    // Get ISO week string (e.g. "2025-W06") for streak freeze - one freeze per week
+    const getISOWeek = (d) => {
+      const date = new Date(d);
+      date.setHours(0, 0, 0, 0);
+      date.setDate(date.getDate() + 4 - (date.getDay() || 7));
+      const yearStart = new Date(date.getFullYear(), 0, 1);
+      const weekNo = Math.ceil((((date - yearStart) / 86400000) + 1) / 7);
+      return `${date.getFullYear()}-W${String(weekNo).padStart(2, '0')}`;
+    };
+    const thisWeek = getISOWeek(today);
+
+    // Calculate streak (with optional streak freeze: one per week when user missed exactly 1 day)
     let newStreak = 1;
+    let usedFreeze = false;
     if (user.lastCheckInDate) {
       const lastCheckIn = new Date(user.lastCheckInDate);
       const daysDiff = Math.floor((today.getTime() - lastCheckIn.getTime()) / (1000 * 60 * 60 * 24));
       if (daysDiff === 1) {
         // Consecutive day - increment streak
         newStreak = (user.checkInStreak || 0) + 1;
+      } else if (daysDiff === 2) {
+        // Missed exactly one day - allow streak freeze once per week
+        const freezeUsedThisWeek = (user.streakFreezeWeek || '') === thisWeek;
+        if (!freezeUsedThisWeek) {
+          newStreak = (user.checkInStreak || 0) + 1;
+          usedFreeze = true;
+          user.streakFreezeWeek = thisWeek;
+        } else {
+          newStreak = 1;
+        }
       } else if (daysDiff > 1) {
-        // Missed a day - reset streak and puppy age
         newStreak = 1;
       }
     }
@@ -1589,6 +1643,8 @@ app.post('/api/daily-checkin/complete', async (req, res) => {
         ? `Puppy fed! 🎉 +${hintsEarned} hints earned!`
         : pointsEarned > 0
         ? `Puppy fed! 🎉 +${pointsEarned} points earned!`
+        : usedFreeze
+        ? "Puppy fed! 🧊 Streak saved with freeze!"
         : "Puppy fed! 🐕",
       lastCheckInDate: user.lastCheckInDate,
       checkInStreak: user.checkInStreak,
@@ -1598,11 +1654,137 @@ app.post('/api/daily-checkin/complete', async (req, res) => {
       pointsEarned,
       totalHints: user.hints || 0,
       totalPoints: user.points || 0,
-      milestone: newStreak === 7 ? '7days' : newStreak === 30 ? '30days' : newStreak === 365 ? '1year' : null
+      milestone: newStreak === 7 ? '7days' : newStreak === 30 ? '30days' : newStreak === 365 ? '1year' : null,
+      usedStreakFreeze: usedFreeze
     });
   } catch (error) {
     console.error('Complete Daily Check-In Error:', error);
     res.status(500).json({ success: false, message: "Server error completing daily check-in." });
+  }
+});
+
+// Daily Puzzle / Daily Run - get status (has completed today?)
+app.get('/api/daily-puzzle/status/:username', async (req, res) => {
+  try {
+    const { username } = req.params;
+    if (!username) return res.status(400).json({ success: false, message: "Username required." });
+    const user = await User.findOne({ username }).select('lastDailyPuzzleDate').lean();
+    if (!user) return res.status(404).json({ success: false, message: "User not found." });
+    const today = new Date();
+    const todayString = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+    const hasCompletedToday = ALLOW_MULTIPLE_DAILY_RUNS ? false : (user.lastDailyPuzzleDate === todayString);
+    res.status(200).json({
+      success: true,
+      hasCompletedToday,
+      lastCompletedDate: user.lastDailyPuzzleDate || null
+    });
+  } catch (error) {
+    console.error('Daily puzzle status error:', error);
+    res.status(500).json({ success: false, message: "Server error." });
+  }
+});
+
+// Comeback bonus - claim 5 hints if user was away 7+ days (one-time per absence)
+app.post('/api/comeback-bonus/claim', async (req, res) => {
+  try {
+    const { username } = req.body;
+    if (!username) return res.status(400).json({ success: false, message: "Username required." });
+    const user = await User.findOne({ username });
+    if (!user) return res.status(404).json({ success: false, message: "User not found." });
+    if (user.comebackBonusClaimed) {
+      return res.status(200).json({ success: false, message: "Already claimed.", totalHints: user.hints || 0 });
+    }
+    const sevenDaysAgo = new Date();
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+    const lastPlayed = user.lastPlayedAt || user.lastLogin || user.createdAt;
+    if (lastPlayed && lastPlayed > sevenDaysAgo) {
+      return res.status(200).json({ success: false, message: "Come back after 7 days away to claim.", totalHints: user.hints || 0 });
+    }
+    const bonusHints = 5;
+    user.hints = (user.hints || 0) + bonusHints;
+    user.comebackBonusClaimed = true;
+    user.lastPlayedAt = new Date();
+    await user.save();
+    res.status(200).json({
+      success: true,
+      message: `Welcome back! +${bonusHints} hints!`,
+      hintsEarned: bonusHints,
+      totalHints: user.hints
+    });
+  } catch (error) {
+    console.error('Comeback bonus claim error:', error);
+    res.status(500).json({ success: false, message: "Server error." });
+  }
+});
+
+// Check if user is eligible for comeback bonus (for UI)
+app.get('/api/comeback-bonus/eligibility/:username', async (req, res) => {
+  try {
+    const { username } = req.params;
+    if (!username) return res.status(400).json({ success: false, message: "Username required." });
+    const user = await User.findOne({ username }).select('lastPlayedAt lastLogin createdAt comebackBonusClaimed').lean();
+    if (!user) return res.status(404).json({ success: false, message: "User not found." });
+    const lastPlayed = user.lastPlayedAt || user.lastLogin || user.createdAt;
+    const sevenDaysAgo = new Date();
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+    const eligible = !user.comebackBonusClaimed && lastPlayed && lastPlayed < sevenDaysAgo;
+    res.status(200).json({ success: true, eligible });
+  } catch (error) {
+    console.error('Comeback bonus eligibility error:', error);
+    res.status(500).json({ success: false, message: "Server error." });
+  }
+});
+
+// Daily Puzzle / Daily Run - complete (grant reward: 3 hints)
+app.post('/api/daily-puzzle/complete', async (req, res) => {
+  try {
+    const { username, puzzleId, score } = req.body;
+    if (!username) return res.status(400).json({ success: false, message: "Username required." });
+    const user = await User.findOne({ username });
+    if (!user) return res.status(404).json({ success: false, message: "User not found." });
+    const today = new Date();
+    const todayString = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+    if (!ALLOW_MULTIPLE_DAILY_RUNS && user.lastDailyPuzzleDate === todayString) {
+      return res.status(200).json({
+        success: true,
+        message: "Already completed today's run!",
+        hintsEarned: 0,
+        totalHints: user.hints || 0
+      });
+    }
+    
+    // Calculate hints based on score
+    let hintsReward = 0;
+    const runScore = score || 0;
+    
+    if (runScore >= 1001) {
+      hintsReward = 5;
+    } else if (runScore >= 501) {
+      hintsReward = 2;
+    } else if (runScore >= 1) {
+      hintsReward = 1;
+    } else {
+      hintsReward = 0;
+    }
+
+    // Update high score if current run is better
+    if (runScore > (user.puppyRunHighScore || 0)) {
+      user.puppyRunHighScore = runScore;
+    }
+
+    user.lastDailyPuzzleDate = todayString;
+    user.hints = (user.hints || 0) + hintsReward;
+    await user.save();
+    res.status(200).json({
+      success: true,
+      message: `Run complete! +${hintsReward} hints!`,
+      hintsEarned: hintsReward,
+      totalHints: user.hints,
+      highScore: user.puppyRunHighScore
+    });
+  } catch (error) {
+    console.error('Daily puzzle complete error:', error);
+    res.status(500).json({ success: false, message: "Server error." });
   }
 });
 
@@ -1710,6 +1892,19 @@ app.post('/api/user/update-level-passed', async (req, res) => {
     } else {
       return res.status(400).json({ success: false, message: "Invalid difficulty. Must be 'Easy', 'Medium', or 'Hard'." });
     }
+    user.lastPlayedAt = new Date();
+
+    const thisWeek = getISOWeekString();
+    if (user.weeklyChallengeWeek !== thisWeek) {
+      user.weeklyChallengeWeek = thisWeek;
+      user.weeklyChallengeProgress = { easy: 0, medium: 0, hard: 0 };
+      user.weeklyChallengeClaimed = false;
+    }
+    const prog = user.weeklyChallengeProgress || { easy: 0, medium: 0, hard: 0 };
+    if (difficulty === 'Easy') prog.easy = (prog.easy || 0) + 1;
+    else if (difficulty === 'Medium') prog.medium = (prog.medium || 0) + 1;
+    else if (difficulty === 'Hard') prog.hard = (prog.hard || 0) + 1;
+    user.weeklyChallengeProgress = prog;
 
     await user.save();
 
@@ -1952,6 +2147,191 @@ app.get('/api/purchase-history/:username', async (req, res) => {
 });
 
 // Leaderboard endpoint - Get top 10 users by points (excluding zero points)
+// ISO week string helper (e.g. "2025-W06") - used by streak freeze and weekly challenge
+function getISOWeekString() {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  d.setDate(d.getDate() + 4 - (d.getDay() || 7));
+  const yearStart = new Date(d.getFullYear(), 0, 1);
+  const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
+  return `${d.getFullYear()}-W${String(weekNo).padStart(2, '0')}`;
+}
+
+// Level of the day - deterministic level + difficulty for 2x points (client applies multiplier)
+app.get('/api/level-of-day', (req, res) => {
+  try {
+    const today = new Date();
+    const dateStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+    let hash = 0;
+    for (let i = 0; i < dateStr.length; i++) {
+      const c = dateStr.charCodeAt(i);
+      hash = ((hash << 5) - hash) + c;
+      hash = hash & hash;
+    }
+    const levelId = (Math.abs(hash) % 100) + 1;
+    const diffIndex = Math.floor(Math.abs(hash) / 100) % 3;
+    const difficulties = ['Easy', 'Medium', 'Hard'];
+    res.status(200).json({
+      success: true,
+      levelId,
+      difficulty: difficulties[diffIndex],
+      date: dateStr
+    });
+  } catch (error) {
+    console.error('Level of day error:', error);
+    res.status(500).json({ success: false, message: "Server error." });
+  }
+});
+
+// Achievements - list definitions (static)
+const ACHIEVEMENT_DEFINITIONS = [
+  { id: 'first_level', name: 'First Steps', desc: 'Clear your first level', icon: '🌟' },
+  { id: 'easy_10', name: 'Easy Explorer', desc: 'Clear 10 Easy levels', icon: '🐕' },
+  { id: 'easy_50', name: 'Easy Master', desc: 'Clear 50 Easy levels', icon: '🏅' },
+  { id: 'medium_10', name: 'Medium Explorer', desc: 'Clear 10 Medium levels', icon: '🐶' },
+  { id: 'hard_5', name: 'Hard Starter', desc: 'Clear 5 Hard levels', icon: '🔥' },
+  { id: 'streak_7', name: 'Week Warrior', desc: '7-day check-in streak', icon: '📅' },
+  { id: 'streak_30', name: 'Monthly Champion', desc: '30-day check-in streak', icon: '👑' },
+  { id: 'referral_1', name: 'Friend Inviter', desc: 'Refer 1 friend who signed up', icon: '🤝' },
+  { id: 'no_hint_clear', name: 'Sharp Eyes', desc: 'Clear a level without using hints', icon: '👁️' }
+];
+
+app.get('/api/achievements', (req, res) => {
+  res.status(200).json({ success: true, achievements: ACHIEVEMENT_DEFINITIONS });
+});
+
+// Achievements - check and unlock (call after level clear, login, or check-in)
+app.post('/api/achievements/check', async (req, res) => {
+  try {
+    const { username } = req.body;
+    if (!username) return res.status(400).json({ success: false, message: "Username required." });
+    const user = await User.findOne({ username });
+    if (!user) return res.status(404).json({ success: false, message: "User not found." });
+    const current = user.achievements || [];
+    const easy = user.levelPassedEasy || 0;
+    const medium = user.levelPassedMedium || 0;
+    const hard = user.levelPassedHard || 0;
+    const streak = user.checkInStreak || 0;
+    const referredCount = await User.countDocuments({ referredBy: new RegExp(`^${username.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\d{4}$`) });
+    const toUnlock = [];
+    if (easy >= 1 && !current.includes('first_level')) toUnlock.push('first_level');
+    if (easy >= 10 && !current.includes('easy_10')) toUnlock.push('easy_10');
+    if (easy >= 50 && !current.includes('easy_50')) toUnlock.push('easy_50');
+    if (medium >= 10 && !current.includes('medium_10')) toUnlock.push('medium_10');
+    if (hard >= 5 && !current.includes('hard_5')) toUnlock.push('hard_5');
+    if (streak >= 7 && !current.includes('streak_7')) toUnlock.push('streak_7');
+    if (streak >= 30 && !current.includes('streak_30')) toUnlock.push('streak_30');
+    if (referredCount >= 1 && !current.includes('referral_1')) toUnlock.push('referral_1');
+    if (toUnlock.length > 0) {
+      user.achievements = [...new Set([...current, ...toUnlock])];
+      await user.save();
+    }
+    res.status(200).json({
+      success: true,
+      achievements: user.achievements || [],
+      newlyUnlocked: toUnlock
+    });
+  } catch (error) {
+    console.error('Achievements check error:', error);
+    res.status(500).json({ success: false, message: "Server error." });
+  }
+});
+
+// Weekly challenge - get current challenge and progress
+app.get('/api/weekly-challenge', async (req, res) => {
+  try {
+    const { username } = req.query;
+    const thisWeek = getISOWeekString();
+    const target = { total: 5 };
+    if (!username) {
+      return res.status(200).json({ success: true, week: thisWeek, target, progress: { easy: 0, medium: 0, hard: 0 }, totalProgress: 0, claimed: false });
+    }
+    const user = await User.findOne({ username }).select('weeklyChallengeWeek weeklyChallengeProgress weeklyChallengeClaimed').lean();
+    let progress = { easy: 0, medium: 0, hard: 0 };
+    let claimed = false;
+    if (user) {
+      if (user.weeklyChallengeWeek === thisWeek) {
+        progress = user.weeklyChallengeProgress || progress;
+        if (typeof progress.easy !== 'number') progress.easy = 0;
+        if (typeof progress.medium !== 'number') progress.medium = 0;
+        if (typeof progress.hard !== 'number') progress.hard = 0;
+        claimed = user.weeklyChallengeClaimed || false;
+      }
+    }
+    const totalProgress = (progress.easy || 0) + (progress.medium || 0) + (progress.hard || 0);
+    res.status(200).json({
+      success: true,
+      week: thisWeek,
+      target,
+      progress,
+      totalProgress,
+      claimed
+    });
+  } catch (error) {
+    console.error('Weekly challenge get error:', error);
+    res.status(500).json({ success: false, message: "Server error." });
+  }
+});
+
+// Weekly challenge - claim reward (5 hints) when totalProgress >= 5 and not yet claimed
+app.post('/api/weekly-challenge/claim', async (req, res) => {
+  try {
+    const { username } = req.body;
+    if (!username) return res.status(400).json({ success: false, message: "Username required." });
+    const user = await User.findOne({ username });
+    if (!user) return res.status(404).json({ success: false, message: "User not found." });
+    const thisWeek = getISOWeekString();
+    if (user.weeklyChallengeWeek !== thisWeek) {
+      user.weeklyChallengeWeek = thisWeek;
+      user.weeklyChallengeProgress = { easy: 0, medium: 0, hard: 0 };
+      user.weeklyChallengeClaimed = false;
+    }
+    const prog = user.weeklyChallengeProgress || { easy: 0, medium: 0, hard: 0 };
+    const total = (prog.easy || 0) + (prog.medium || 0) + (prog.hard || 0);
+    if (total < 5) {
+      return res.status(400).json({ success: false, message: "Clear 5 levels this week to claim.", totalHints: user.hints || 0 });
+    }
+    if (user.weeklyChallengeClaimed) {
+      return res.status(200).json({ success: false, message: "Already claimed.", totalHints: user.hints || 0 });
+    }
+    const rewardHints = 5;
+    user.hints = (user.hints || 0) + rewardHints;
+    user.weeklyChallengeClaimed = true;
+    await user.save();
+    res.status(200).json({
+      success: true,
+      message: `Weekly challenge complete! +${rewardHints} hints!`,
+      hintsEarned: rewardHints,
+      totalHints: user.hints
+    });
+  } catch (error) {
+    console.error('Weekly challenge claim error:', error);
+    res.status(500).json({ success: false, message: "Server error." });
+  }
+});
+
+// Referral leaderboard - top referrers by count of referred users
+app.get('/api/leaderboard/referrals', async (req, res) => {
+  try {
+    const agg = await User.aggregate([
+      { $match: { referredBy: { $exists: true, $ne: null, $ne: "" } } },
+      { $group: { _id: "$referredBy", count: { $sum: 1 } } },
+      { $sort: { count: -1 } },
+      { $limit: 10 },
+      { $project: { referrerUsername: "$_id", referredCount: "$count", _id: 0 } }
+    ]);
+    const leaderboard = agg.map((row, index) => ({
+      username: row.referrerUsername,
+      rank: index + 1,
+      referredCount: row.referredCount
+    }));
+    res.status(200).json({ success: true, leaderboard });
+  } catch (error) {
+    console.error('Referral leaderboard error:', error);
+    res.status(500).json({ success: false, message: "Server error." });
+  }
+});
+
 app.get('/api/leaderboard', async (req, res) => {
   try {
     const { username } = req.query; // Get current username from query params
@@ -2048,7 +2428,10 @@ app.get('/api/user/:username', async (req, res) => {
         levelPassedEasy: user.levelPassedEasy || 0,
         levelPassedMedium: user.levelPassedMedium || 0,
         levelPassedHard: user.levelPassedHard || 0,
-        referredBy: user.referredBy || ""
+        referredBy: user.referredBy || "",
+        lastPlayedAt: user.lastPlayedAt || null,
+        comebackBonusClaimed: user.comebackBonusClaimed || false,
+        achievements: user.achievements || []
       } 
     });
   } catch (error) {
