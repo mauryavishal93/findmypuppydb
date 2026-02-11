@@ -93,9 +93,19 @@ if (isProduction) {
 const MONGO_URI = process.env.MONGO_URI || process.env.MONGODB_URI || "mongodb+srv://vimaurya24_db_user:jrPF6GqaTX9H40s1@findmypuppy.q6hlrak.mongodb.net/findmypuppy?appName=findmypuppy";
 const COLLECTION_NAME = "user"; 
 
-mongoose.connect(MONGO_URI)
+mongoose.connect(MONGO_URI, {
+  maxPoolSize: 10, // Maintain up to 10 socket connections
+  serverSelectionTimeoutMS: 30000, // Keep trying to send operations for 30 seconds (default)
+  socketTimeoutMS: 45000, // Close sockets after 45 seconds of inactivity
+})
   .then(() => console.log('✅ Connected to MongoDB Atlas successfully!'))
-  .catch(err => console.error('❌ MongoDB Connection Error:', err));
+  .catch(err => {
+    console.error('❌ MongoDB Connection Error:', err.message);
+    if (err.name === 'MongooseServerSelectionError') {
+      console.error('   -> HINT: Check your IP Whitelist in MongoDB Atlas. Your current IP might be blocked.');
+      console.error('   -> HINT: Ensure your firewall allows outbound traffic on port 27017.');
+    }
+  });
 
 // Schema Definition
 const userSchema = new mongoose.Schema({
@@ -134,11 +144,14 @@ const userSchema = new mongoose.Schema({
   banned: { type: Boolean, default: false },
   bannedAt: { type: Date },
   bannedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'AdminUser' },
-  banReason: { type: String },
+  bannedReason: { type: String },
 }, { collection: COLLECTION_NAME });
 
 // Ensure strict is false for this model just in case
 userSchema.set('strict', false);
+
+// Optimize: Add index on username for faster lookups (email is already indexed by unique: true)
+userSchema.index({ username: 1 });
 
 // Note: Email field already has index via 'unique: true' and 'index: true' in schema definition
 // No need for explicit userSchema.index() call to avoid duplicate index warning
@@ -160,6 +173,9 @@ const purchaseHistorySchema = new mongoose.Schema({
   // How the purchase was made: 'Money' (₹) or 'Points' (Pts)
   purchaseMode: { type: String, enum: ['Money', 'Points','Referral'], default: 'Money' }
 }, { collection: 'purchaseHistory' });
+
+// Optimize: Add compound index for fetching history by username
+purchaseHistorySchema.index({ username: 1, purchaseDate: -1 });
 
 const PurchaseHistory = mongoose.model('PurchaseHistory', purchaseHistorySchema);
 
@@ -1484,7 +1500,8 @@ app.post('/api/user/update-hints', async (req, res) => {
 app.get('/api/daily-checkin/status/:username', async (req, res) => {
   try {
     const { username } = req.params;
-    const user = await User.findOne({ username });
+    // Optimize: use lean() for faster read-only access
+    const user = await User.findOne({ username }).lean();
     if (!user) {
       return res.status(404).json({ success: false, message: "User not found." });
     }
@@ -2122,11 +2139,13 @@ app.get('/api/purchase-history/:username', async (req, res) => {
     // }
 
     // Only fetch purchases where mode is Money or Referral (exclude Points)
+    // Optimize: use lean() and ensure index is used
     const purchases = await PurchaseHistory.find({ 
       username,
       purchaseMode: { $in: ['Money', 'Referral'] }
     })
       .sort({ purchaseDate: -1 }) // Most recent first
+      .lean()
       .exec();
 
     res.status(200).json({ 
@@ -2412,7 +2431,8 @@ app.get('/api/user/:username', async (req, res) => {
     //   });
     // }
 
-    const user = await User.findOne({ username });
+    // Optimize: use lean() for faster read-only access
+    const user = await User.findOne({ username }).lean();
     if (!user) {
       return res.status(404).json({ success: false, message: "User not found." });
     }
