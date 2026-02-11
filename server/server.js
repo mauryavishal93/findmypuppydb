@@ -138,6 +138,7 @@ const userSchema = new mongoose.Schema({
   weeklyChallengeWeek: { type: String, default: null }, // "YYYY-Www"
   weeklyChallengeProgress: { type: mongoose.Schema.Types.Mixed, default: { easy: 0, medium: 0, hard: 0 } },
   weeklyChallengeClaimed: { type: Boolean, default: false },
+  unlockedThemes: { type: [String], default: ['sunny', 'night'] }, // Themes unlocked by user (default: first 2)
   createdAt: { type: Date, default: Date.now },
   lastLogin: { type: Date, default: Date.now },
   // Admin: ban
@@ -2451,12 +2452,91 @@ app.get('/api/user/:username', async (req, res) => {
         referredBy: user.referredBy || "",
         lastPlayedAt: user.lastPlayedAt || null,
         comebackBonusClaimed: user.comebackBonusClaimed || false,
-        achievements: user.achievements || []
+        achievements: user.achievements || [],
+        unlockedThemes: user.unlockedThemes || ['sunny', 'night']
       } 
     });
   } catch (error) {
     console.error('Get User Error:', error);
     res.status(500).json({ success: false, message: "Server error fetching user data." });
+  }
+});
+
+// Get unlocked themes for a user
+app.get('/api/user/:username/themes', async (req, res) => {
+  try {
+    const { username } = req.params;
+    const user = await User.findOne({ username }).lean();
+    if (!user) {
+      return res.status(404).json({ success: false, message: "User not found." });
+    }
+    res.status(200).json({ 
+      success: true, 
+      unlockedThemes: user.unlockedThemes || ['sunny', 'night']
+    });
+  } catch (error) {
+    console.error('Get Themes Error:', error);
+    res.status(500).json({ success: false, message: "Server error fetching themes." });
+  }
+});
+
+// Unlock a theme (by games completed or points spent)
+app.post('/api/user/:username/unlock-theme', async (req, res) => {
+  try {
+    const { username } = req.params;
+    const { theme, unlockMethod } = req.body; // unlockMethod: 'games' or 'points'
+    
+    if (!theme) {
+      return res.status(400).json({ success: false, message: "Theme is required." });
+    }
+    
+    const user = await User.findOne({ username });
+    if (!user) {
+      return res.status(404).json({ success: false, message: "User not found." });
+    }
+    
+    // Ensure unlockedThemes exists
+    if (!user.unlockedThemes || user.unlockedThemes.length < 2) {
+      user.unlockedThemes = ['sunny', 'night'];
+    }
+    
+    // Check if already unlocked
+    if (user.unlockedThemes.includes(theme)) {
+      return res.status(200).json({ 
+        success: true, 
+        message: "Theme already unlocked.",
+        unlockedThemes: user.unlockedThemes
+      });
+    }
+    
+    // If unlocking with points, check balance
+    if (unlockMethod === 'points') {
+      const THEME_UNLOCK_COST = 25;
+      if ((user.points || 0) < THEME_UNLOCK_COST) {
+        return res.status(400).json({ 
+          success: false, 
+          message: `Not enough points. Need ${THEME_UNLOCK_COST} points to unlock this theme.` 
+        });
+      }
+      // Deduct points
+      user.points = (user.points || 0) - THEME_UNLOCK_COST;
+    }
+    
+    // Unlock the theme
+    user.unlockedThemes.push(theme);
+    await user.save();
+    
+    res.status(200).json({ 
+      success: true, 
+      message: unlockMethod === 'points' 
+        ? `Theme unlocked! ${25} points deducted.` 
+        : "Theme unlocked!",
+      unlockedThemes: user.unlockedThemes,
+      points: user.points
+    });
+  } catch (error) {
+    console.error('Unlock Theme Error:', error);
+    res.status(500).json({ success: false, message: "Server error unlocking theme." });
   }
 });
 
