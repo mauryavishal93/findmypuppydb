@@ -1274,6 +1274,55 @@ app.post('/api/auth/reset-password', async (req, res) => {
   }
 });
 
+// Delete Account Permanently (requires username + password verification)
+app.post('/api/auth/delete-account', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+
+    if (!username || !password) {
+      return res.status(400).json({ success: false, message: "Username and password are required." });
+    }
+
+    const user = await User.findOne({ username });
+    if (!user) {
+      return res.status(404).json({ success: false, message: "User not found." });
+    }
+
+    // Google OAuth users without password must set one via forgot-password first
+    if (user.authProvider === 'google' && !user.password) {
+      return res.status(400).json({
+        success: false,
+        message: "This account uses Google sign-in. Please use 'Forgot Password' to set a password first, then return here to delete your account.",
+      });
+    }
+
+    if (!user.password) {
+      return res.status(401).json({ success: false, message: "Invalid authentication method." });
+    }
+
+    const isPasswordValid = await bcrypt.compare(password, user.password);
+    if (!isPasswordValid) {
+      return res.status(401).json({ success: false, message: "Incorrect password." });
+    }
+
+    // Delete related data first
+    await PurchaseHistory.deleteMany({ username });
+    await User.deleteOne({ username });
+
+    console.log(`[DELETE-ACCOUNT] Account permanently deleted: ${username}`);
+    res.status(200).json({
+      success: true,
+      message: "Your account has been permanently deleted.",
+    });
+  } catch (error) {
+    console.error("[DELETE-ACCOUNT] Error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Server error while deleting account. Please try again later.",
+    });
+  }
+});
+
 // Google OAuth Sign In Endpoint
 app.post('/api/auth/google/signin', async (req, res) => {
   try {
