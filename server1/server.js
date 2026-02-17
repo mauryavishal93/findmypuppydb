@@ -459,14 +459,6 @@ app.post('/api/signup', async (req, res) => {
       });
       await rewardEntry.save();
       console.log(`✅ Referrer reward saved: ${referrerUser.username}`);
-      
-      // Check referral achievement for referrer
-      const referrerAchievements = referrerUser.achievements || [];
-      const referredCount = await User.countDocuments({ referredBy: new RegExp(`^${referrerUser.username.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\d{4}$`) });
-      if (referredCount >= 1 && !referrerAchievements.includes('referral_1')) {
-        referrerUser.achievements = [...new Set([...referrerAchievements, 'referral_1'])];
-        await referrerUser.save();
-      }
     }
 
     // Prepare response user object - BE EXPLICIT
@@ -1712,16 +1704,6 @@ app.post('/api/daily-checkin/complete', async (req, res) => {
 
     await user.save();
 
-    // Check achievements after daily check-in (for streak achievements)
-    const currentAchievements = user.achievements || [];
-    const streakAchievementsToUnlock = [];
-    if (newStreak >= 7 && !currentAchievements.includes('streak_7')) streakAchievementsToUnlock.push('streak_7');
-    if (newStreak >= 30 && !currentAchievements.includes('streak_30')) streakAchievementsToUnlock.push('streak_30');
-    if (streakAchievementsToUnlock.length > 0) {
-      user.achievements = [...new Set([...currentAchievements, ...streakAchievementsToUnlock])];
-      await user.save();
-    }
-
     res.status(200).json({
       success: true,
       message: hintsEarned > 0 
@@ -1740,8 +1722,7 @@ app.post('/api/daily-checkin/complete', async (req, res) => {
       totalHints: user.hints || 0,
       totalPoints: user.points || 0,
       milestone: newStreak === 7 ? '7days' : newStreak === 30 ? '30days' : newStreak === 365 ? '1year' : null,
-      usedStreakFreeze: usedFreeze,
-      newlyUnlockedAchievements: streakAchievementsToUnlock
+      usedStreakFreeze: usedFreeze
     });
   } catch (error) {
     console.error('Complete Daily Check-In Error:', error);
@@ -2291,7 +2272,7 @@ app.get('/api/achievements', (req, res) => {
 // Achievements - check and unlock (call after level clear, login, or check-in)
 app.post('/api/achievements/check', async (req, res) => {
   try {
-    const { username, noHintsUsed } = req.body;
+    const { username } = req.body;
     if (!username) return res.status(400).json({ success: false, message: "Username required." });
     const user = await User.findOne({ username });
     if (!user) return res.status(404).json({ success: false, message: "User not found." });
@@ -2302,26 +2283,14 @@ app.post('/api/achievements/check', async (req, res) => {
     const streak = user.checkInStreak || 0;
     const referredCount = await User.countDocuments({ referredBy: new RegExp(`^${username.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\d{4}$`) });
     const toUnlock = [];
-    
-    // Level-based achievements
     if (easy >= 1 && !current.includes('first_level')) toUnlock.push('first_level');
     if (easy >= 10 && !current.includes('easy_10')) toUnlock.push('easy_10');
     if (easy >= 50 && !current.includes('easy_50')) toUnlock.push('easy_50');
     if (medium >= 10 && !current.includes('medium_10')) toUnlock.push('medium_10');
     if (hard >= 5 && !current.includes('hard_5')) toUnlock.push('hard_5');
-    
-    // Streak achievements
     if (streak >= 7 && !current.includes('streak_7')) toUnlock.push('streak_7');
     if (streak >= 30 && !current.includes('streak_30')) toUnlock.push('streak_30');
-    
-    // Referral achievement
     if (referredCount >= 1 && !current.includes('referral_1')) toUnlock.push('referral_1');
-    
-    // Sharp Eyes achievement - clear level without using hints
-    if (noHintsUsed === true && !current.includes('no_hint_clear')) {
-      toUnlock.push('no_hint_clear');
-    }
-    
     if (toUnlock.length > 0) {
       user.achievements = [...new Set([...current, ...toUnlock])];
       await user.save();
