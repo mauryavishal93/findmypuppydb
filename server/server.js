@@ -3053,6 +3053,14 @@ app.get('/privacy-policy.html', (req, res) => {
   }
 });
 
+app.get('/explorer-guide', (req, res) => {
+  if (isProduction) {
+    res.sendFile(join(__dirname, '..', 'dist', 'explorer-guide.html'));
+  } else {
+    res.sendFile(join(__dirname, '..', 'public', 'explorer-guide.html'));
+  }
+});
+
 // Try to listen on PORT; if EADDRINUSE, try next port (5775, 5776, ...) until one is free
 function startServer(tryPort) {
   const server = app.listen(tryPort, () => {
