@@ -660,6 +660,15 @@ if (emailTransporter) {
 }
 console.log('📧 ================================================\n');
 
+// Log password-reset URL base when on Render (so deployers can verify reset links)
+if (process.env.RENDER === 'true') {
+  const frontendUrl = process.env.FRONTEND_URL || 'https://findmypuppy.onrender.com';
+  console.log('🔗 [RENDER] Password reset links will use FRONTEND_URL:', frontendUrl);
+  if (!process.env.FRONTEND_URL) {
+    console.warn('   ⚠️  Set FRONTEND_URL in Render env if your app is not at https://findmypuppy.onrender.com');
+  }
+}
+
 // Password Reset Request Endpoint
 app.post('/api/auth/forgot-password', async (req, res) => {
   try {
@@ -968,13 +977,13 @@ Find My Puppy | Where Adventure Meets Fun 🎮
         
         // Try sending with current transporter first
         // If it fails with timeout/connection error, try creating a new transporter with port 465
+        const currentPort = parseInt(process.env.SMTP_PORT || (isProduction ? '465' : '587'));
         const trySendEmail = async (attempt = 1, maxAttempts = 3, useFallbackPort = false) => {
           try {
             let transporterToUse = emailTransporter;
             
             // On second attempt in production, try port 465 as fallback if currently using 587
             if (attempt === 2 && isProduction && !useFallbackPort) {
-              const currentPort = parseInt(process.env.SMTP_PORT || (isProduction ? '465' : '587'));
               if (currentPort === 587) {
                 console.log(`   🔄 [FALLBACK] Attempting to create new transporter with port 465 (SSL)...`);
                 try {
@@ -1004,8 +1013,18 @@ Find My Puppy | Where Adventure Meets Fun 🎮
             
             console.log(`📤 [FORGOT-PASSWORD] Attempt ${attempt}/${maxAttempts}: Sending password reset email to ${user.email}...`);
             console.log(`   Mail options prepared: from="${fromEmail}", to="${user.email}"`);
+            
+            // Log current SMTP configuration
+            const currentSecure = process.env.SMTP_SECURE !== undefined 
+              ? process.env.SMTP_SECURE === 'true' 
+              : (isProduction ? true : false);
+            console.log(`   [SMTP-CONFIG] Port: ${currentPort}, Secure: ${currentSecure}, Host: ${process.env.SMTP_HOST || 'smtp.gmail.com'}`);
+            
             if (useFallbackPort) {
               console.log(`   Using fallback configuration: Port 465 with SSL`);
+            } else if (currentPort === 587 && isProduction) {
+              console.warn(`   ⚠️  [SMTP-CONFIG] WARNING: Using port 587 in production - Gmail may block this from Render IPs`);
+              console.warn(`   ⚠️  [SMTP-CONFIG] RECOMMENDATION: Set SMTP_PORT=465 and SMTP_SECURE=true in Render`);
             }
             
             // Verify transporter is still valid before sending
@@ -1016,22 +1035,49 @@ Find My Puppy | Where Adventure Meets Fun 🎮
             const sendStartTime = Date.now();
             console.log(`   [EMAIL-SEND] Timeout set to ${sendTimeout}ms (${isProduction ? 'PRODUCTION' : 'DEVELOPMENT'})`);
             
+            // Log SMTP configuration being used
+            const currentConfig = transporterToUse.options || {};
+            console.log(`   [EMAIL-SEND] SMTP Config: Host=${currentConfig.host || 'unknown'}, Port=${currentConfig.port || 'unknown'}, Secure=${currentConfig.secure !== undefined ? currentConfig.secure : 'unknown'}`);
+            console.log(`   [EMAIL-SEND] Starting sendMail() at ${new Date().toISOString()}...`);
+            
             // Use AbortController for better timeout handling
             const controller = new AbortController();
             const timeoutId = setTimeout(() => {
               controller.abort();
             }, sendTimeout);
             
+            let sendPromiseStarted = false;
+            let timeoutTriggered = false;
+            
             try {
-              const sendPromise = transporterToUse.sendMail(mailOptions);
+              const sendPromise = transporterToUse.sendMail(mailOptions)
+                .then((result) => {
+                  if (timeoutTriggered) {
+                    console.warn(`   ⚠️  [EMAIL-SEND] sendMail completed but timeout already triggered`);
+                  }
+                  return result;
+                })
+                .catch((err) => {
+                  console.error(`   ❌ [EMAIL-SEND] sendMail promise rejected: ${err.message || err.code || err.toString()}`);
+                  throw err;
+                });
+              
+              sendPromiseStarted = true;
+              console.log(`   [EMAIL-SEND] sendMail promise created, waiting for response...`);
+              
               const timeoutPromise = new Promise((_, reject) => 
-                setTimeout(() => reject(new Error(`Email send timeout after ${sendTimeout/1000} seconds`)), sendTimeout)
+                setTimeout(() => {
+                  timeoutTriggered = true;
+                  console.error(`   ⏱️  [EMAIL-SEND] TIMEOUT triggered after ${sendTimeout/1000} seconds`);
+                  console.error(`   ⏱️  [EMAIL-SEND] This usually means Gmail SMTP is blocking the connection`);
+                  reject(new Error(`Email send timeout after ${sendTimeout/1000} seconds`));
+                }, sendTimeout)
               );
               
               const info = await Promise.race([sendPromise, timeoutPromise]);
               clearTimeout(timeoutId);
               const sendDuration = Date.now() - sendStartTime;
-              console.log(`   Email send completed in ${sendDuration}ms`);
+              console.log(`   ✅ [EMAIL-SEND] Email send completed successfully in ${sendDuration}ms`);
               
               console.log(`✅ Password reset email sent successfully!`);
               console.log(`   Message ID: ${info.messageId || 'N/A'}`);
@@ -1061,8 +1107,17 @@ Find My Puppy | Where Adventure Meets Fun 🎮
               (error.message && error.message.includes('timeout'))
             )) {
               const retryDelay = attempt * 3000; // Exponential backoff: 3s, 6s, 9s
-              console.warn(`   ⚠️  Connection/timeout error on attempt ${attempt}, retrying in ${retryDelay}ms...`);
-              console.warn(`   Error: ${error.message || error.code || 'Unknown'}`);
+              console.warn(`   ⚠️  Connection/timeout error on attempt ${attempt}/${maxAttempts}`);
+              console.warn(`   Error Code: ${error.code || 'NONE'}`);
+              console.warn(`   Error Message: ${error.message || 'Unknown'}`);
+              console.warn(`   Retrying in ${retryDelay}ms...`);
+              
+              // If timeout and we're on port 587, suggest switching to 465
+              if (error.message && error.message.includes('timeout') && currentPort === 587) {
+                console.warn(`   💡 SUGGESTION: Port 587 is likely blocked by Gmail from Render`);
+                console.warn(`   💡 Set SMTP_PORT=465 and SMTP_SECURE=true in Render environment`);
+              }
+              
               await new Promise(resolve => setTimeout(resolve, retryDelay));
               return trySendEmail(attempt + 1, maxAttempts, useFallbackPort);
             }
