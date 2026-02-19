@@ -139,6 +139,7 @@ const userSchema = new mongoose.Schema({
   weeklyChallengeProgress: { type: mongoose.Schema.Types.Mixed, default: { easy: 0, medium: 0, hard: 0 } },
   weeklyChallengeClaimed: { type: Boolean, default: false },
   unlockedThemes: { type: [String], default: ['sunny', 'night'] }, // Themes unlocked by user (default: first 2)
+  selectedTheme: { type: String, default: 'night' }, // Currently selected theme (default: Starry Night)
   createdAt: { type: Date, default: Date.now },
   lastLogin: { type: Date, default: Date.now },
   // Admin: ban
@@ -2588,7 +2589,8 @@ app.get('/api/user/:username', async (req, res) => {
         lastPlayedAt: user.lastPlayedAt || null,
         comebackBonusClaimed: user.comebackBonusClaimed || false,
         achievements: user.achievements || [],
-        unlockedThemes: user.unlockedThemes || ['sunny', 'night']
+        unlockedThemes: user.unlockedThemes || ['sunny', 'night'],
+        selectedTheme: user.selectedTheme || 'night'
       } 
     });
   } catch (error) {
@@ -2615,14 +2617,19 @@ app.get('/api/user/:username/themes', async (req, res) => {
   }
 });
 
-// Unlock a theme (by games completed or points spent)
+// Unlock a theme (by points spent - 25 points per theme)
 app.post('/api/user/:username/unlock-theme', async (req, res) => {
   try {
     const { username } = req.params;
-    const { theme, unlockMethod } = req.body; // unlockMethod: 'games' or 'points'
+    const { theme, unlockMethod } = req.body; // unlockMethod should be 'points'
     
     if (!theme) {
       return res.status(400).json({ success: false, message: "Theme is required." });
+    }
+    
+    // Only allow points method
+    if (unlockMethod !== 'points') {
+      return res.status(400).json({ success: false, message: "Themes can only be unlocked with points." });
     }
     
     const user = await User.findOne({ username });
@@ -2644,18 +2651,17 @@ app.post('/api/user/:username/unlock-theme', async (req, res) => {
       });
     }
     
-    // If unlocking with points, check balance
-    if (unlockMethod === 'points') {
-      const THEME_UNLOCK_COST = 25;
-      if ((user.points || 0) < THEME_UNLOCK_COST) {
-        return res.status(400).json({ 
-          success: false, 
-          message: `Not enough points. Need ${THEME_UNLOCK_COST} points to unlock this theme.` 
-        });
-      }
-      // Deduct points
-      user.points = (user.points || 0) - THEME_UNLOCK_COST;
+    // Check balance and deduct points
+    const THEME_UNLOCK_COST = 25;
+    if ((user.points || 0) < THEME_UNLOCK_COST) {
+      return res.status(400).json({ 
+        success: false, 
+        message: `Not enough points. Need ${THEME_UNLOCK_COST} points to unlock this theme.` 
+      });
     }
+    
+    // Deduct points
+    user.points = (user.points || 0) - THEME_UNLOCK_COST;
     
     // Unlock the theme
     user.unlockedThemes.push(theme);
@@ -2663,15 +2669,51 @@ app.post('/api/user/:username/unlock-theme', async (req, res) => {
     
     res.status(200).json({ 
       success: true, 
-      message: unlockMethod === 'points' 
-        ? `Theme unlocked! ${25} points deducted.` 
-        : "Theme unlocked!",
+      message: `Theme unlocked! ${THEME_UNLOCK_COST} points deducted.`,
       unlockedThemes: user.unlockedThemes,
       points: user.points
     });
   } catch (error) {
     console.error('Unlock Theme Error:', error);
     res.status(500).json({ success: false, message: "Server error unlocking theme." });
+  }
+});
+
+// Update selected theme for a user
+app.post('/api/user/:username/update-theme', async (req, res) => {
+  try {
+    const { username } = req.params;
+    const { theme } = req.body;
+    
+    if (!theme) {
+      return res.status(400).json({ success: false, message: "Theme is required." });
+    }
+    
+    const user = await User.findOne({ username });
+    if (!user) {
+      return res.status(404).json({ success: false, message: "User not found." });
+    }
+    
+    // Validate theme exists in unlocked themes
+    const unlockedThemes = user.unlockedThemes || ['sunny', 'night'];
+    if (!unlockedThemes.includes(theme)) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Theme not unlocked. Unlock it first before selecting." 
+      });
+    }
+    
+    user.selectedTheme = theme;
+    await user.save();
+    
+    res.status(200).json({ 
+      success: true, 
+      message: "Theme updated successfully.",
+      selectedTheme: user.selectedTheme
+    });
+  } catch (error) {
+    console.error('Update Theme Error:', error);
+    res.status(500).json({ success: false, message: "Server error updating theme." });
   }
 });
 
@@ -3057,7 +3099,7 @@ app.get('/explorer-guide', (req, res) => {
   if (isProduction) {
     res.sendFile(join(__dirname, '..', 'dist', 'explorer-guide.html'));
   } else {
-    res.sendFile(join(__dirname, '..', 'public', 'explorer-guide.html'));
+    res.sendFile(join(__dirname, '..', 'explorer-guide.html'));
   }
 });
 
