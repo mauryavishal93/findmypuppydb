@@ -154,9 +154,16 @@ userSchema.set('strict', false);
 
 // Optimize: Add index on username for faster lookups (email is already indexed by unique: true)
 userSchema.index({ username: 1 });
-
-// Note: Email field already has index via 'unique: true' and 'index: true' in schema definition
-// No need for explicit userSchema.index() call to avoid duplicate index warning
+// Admin dashboard: DAU/MAU counts and user list sorting
+userSchema.index({ lastLogin: -1 });
+// Admin user list filters
+userSchema.index({ banned: 1 });
+userSchema.index({ authProvider: 1 });
+// Admin user list sorting
+userSchema.index({ points: -1 });
+userSchema.index({ hints: -1 });
+// Referrals lookup
+userSchema.index({ referredBy: 1 });
 
 // Clear model cache to ensure latest schema is used
 if (mongoose.models['User']) {
@@ -172,12 +179,21 @@ const purchaseHistorySchema = new mongoose.Schema({
   amount: { type: Number, required: true },
   purchaseType: { type: String, required: true, enum: ['Premium', 'Hints'] },
   pack: { type: String, required: true }, // Hint count or Premium type
+  hintsCount: { type: Number, default: 0 }, // Actual number of hints in this transaction
   // How the purchase was made: 'Money' (₹) or 'Points' (Pts)
   purchaseMode: { type: String, enum: ['Money', 'Points','Referral'], default: 'Money' }
 }, { collection: 'purchaseHistory' });
 
-// Optimize: Add compound index for fetching history by username
+// Optimize: compound indexes for all admin query patterns
 purchaseHistorySchema.index({ username: 1, purchaseDate: -1 });
+// Dashboard revenue aggregations: filter by purchaseMode + date range
+purchaseHistorySchema.index({ purchaseMode: 1, purchaseDate: -1 });
+// Dashboard hints aggregations: filter by purchaseType + purchaseMode
+purchaseHistorySchema.index({ purchaseType: 1, purchaseMode: 1 });
+// Razorpay hints lookup by purchaseId prefix
+purchaseHistorySchema.index({ purchaseId: 1 });
+// Shop transactions list: purchaseMode + amount filter + date sort
+purchaseHistorySchema.index({ purchaseMode: 1, amount: 1, purchaseDate: -1 });
 
 const PurchaseHistory = mongoose.model('PurchaseHistory', purchaseHistorySchema);
 
@@ -251,7 +267,43 @@ mongoose.connection.once('open', async () => {
     }
   } catch (error) {
     console.error("⚠️ Migration Error:", error);
-  }  
+  }
+
+  // Migration: Backfill hintsCount for ALL existing Hints purchase records
+  // (Razorpay "pay_*", Points "2 Hints Pack (Points)", Referral "Referral Reward (25 Hints)")
+  // Supports two pack string patterns:
+  //   • Leading number:  "100 Hints Pack"  → 100
+  //   • Number in parens: "Referral Reward (25 Hints)" → 25
+  const parseHintsFromPack = (pack) => {
+    const s = String(pack || '');
+    const leading = s.match(/^(\d+)/);
+    if (leading) return parseInt(leading[1], 10);
+    const inParens = s.match(/\((\d+)\s*Hints?\)/i);
+    if (inParens) return parseInt(inParens[1], 10);
+    return 0;
+  };
+
+  try {
+    const staleRecords = await PurchaseHistory.find({
+      purchaseType: 'Hints',
+      $or: [{ hintsCount: { $exists: false } }, { hintsCount: 0 }],
+    }).lean();
+
+    if (staleRecords.length > 0) {
+      const bulkOps = staleRecords.map((rec) => ({
+        updateOne: {
+          filter: { _id: rec._id },
+          update: { $set: { hintsCount: parseHintsFromPack(rec.pack) } },
+        },
+      }));
+      const bulkResult = await PurchaseHistory.bulkWrite(bulkOps);
+      console.log(`✅ hintsCount backfill: updated ${bulkResult.modifiedCount} purchase records (Razorpay + Points + Referral)`);
+    } else {
+      console.log('ℹ️ hintsCount backfill: all records already have hintsCount set');
+    }
+  } catch (error) {
+    console.error('⚠️ hintsCount backfill migration error:', error);
+  }
 });
 
 // --- ROUTES ---
@@ -1741,9 +1793,9 @@ app.post('/api/daily-checkin/complete', async (req, res) => {
       hintsEarned = 10;
       milestone = '7days';
     }
-    // 30 days streak = 50 points (only on day 30)
+    // 30 days streak = 50 hints (only on day 30)
     else if (newStreak === 30) {
-      pointsEarned = 50;
+      hintsEarned = 50;
       milestone = '30days';
     }
     // 365 days (1 year) streak = 1000 hints (only on day 365)
@@ -2126,6 +2178,7 @@ app.post('/api/razorpay/verify-payment', async (req, res) => {
         amount: req.body.amount || 0,
         purchaseType: 'Hints',
         pack,
+        hintsCount: hintsToAdd || 0,
         purchaseMode: 'Money'
       });
       await purchase.save();
@@ -2167,6 +2220,17 @@ app.post('/api/purchase-history', async (req, res) => {
 
     // Default purchaseMode to 'Money' if not provided (for backward compatibility)
     const safePurchaseMode = purchaseMode === 'Points' ? 'Points' : 'Money';
+
+    // Parse hint quantity from pack string for accurate tracking
+    const parseHintsFromPack = (p) => {
+      const s = String(p || '');
+      const leading = s.match(/^(\d+)/);
+      if (leading) return parseInt(leading[1], 10);
+      const inParens = s.match(/\((\d+)\s*Hints?\)/i);
+      if (inParens) return parseInt(inParens[1], 10);
+      return 0;
+    };
+    const hintsCount = purchaseType === 'Hints' ? parseHintsFromPack(pack) : 0;
 
     // --- De-duplication guard ---
     // If there is already a purchase with the same user, pack, type and mode
@@ -2210,13 +2274,14 @@ app.post('/api/purchase-history', async (req, res) => {
       },
       {
         $setOnInsert: {
-      username,
-      purchaseId,
-      amount,
-      purchaseType,
-      pack,
+          username,
+          purchaseId,
+          amount,
+          purchaseType,
+          pack,
+          hintsCount,
           purchaseMode: safePurchaseMode,
-      purchaseDate: new Date()
+          purchaseDate: new Date()
         }
       },
       {
