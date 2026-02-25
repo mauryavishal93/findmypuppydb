@@ -2087,6 +2087,7 @@ app.post('/api/user/update-level-passed', async (req, res) => {
       return res.status(400).json({ success: false, message: "Invalid difficulty. Must be 'Easy', 'Medium', or 'Hard'." });
     }
     user.lastPlayedAt = new Date();
+    user.lastLogin = new Date(); // Count as active user when they play (Admin DAU/MAU)
 
     const thisWeek = getISOWeekString();
     if (user.weeklyChallengeWeek !== thisWeek) {
@@ -2619,22 +2620,12 @@ app.get('/api/leaderboard', async (req, res) => {
 app.get('/api/user/:username', async (req, res) => {
   try {
     const { username } = req.params;
-    // Get current user from query parameter or header (for authorization)
-    // const currentUser = req.query.username || req.headers['x-current-user'];
-
-    // // Authorization check: Users can only access their own data
-
-    // console.log("currentUser", currentUser);
-    // console.log("username", username);
-    // if (!currentUser || currentUser !== username) {
-    //   return res.status(403).json({ 
-    //     success: false, 
-    //     message: "Access denied. You can only view your own user data." 
-    //   });
-    // }
-
-    // Optimize: use lean() for faster read-only access
-    const user = await User.findOne({ username }).lean();
+    // Update lastLogin so loading the game counts as active user (for Admin DAU/MAU)
+    const user = await User.findOneAndUpdate(
+      { username },
+      { $set: { lastLogin: new Date() } },
+      { new: true }
+    ).lean();
     if (!user) {
       return res.status(404).json({ success: false, message: "User not found." });
     }

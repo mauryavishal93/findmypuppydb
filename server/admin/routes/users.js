@@ -11,46 +11,63 @@ const router = Router();
 const User = () => mongoose.models.User;
 const PurchaseHistory = () => mongoose.models.PurchaseHistory;
 
+// Fields returned in the users list — only what the admin table needs
+const USER_LIST_PROJECTION = {
+  username: 1, email: 1, authProvider: 1, points: 1, hints: 1,
+  levelPassedEasy: 1, levelPassedMedium: 1, levelPassedHard: 1,
+  banned: 1, lastLogin: 1, createdAt: 1,
+};
+
 router.get('/', requireAdmin, requirePermission('users:read'), async (req, res) => {
   try {
-    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
-    const limit = Math.min(5000, Math.max(1, parseInt(req.query.limit, 10) || 500));
-    const skip = (page - 1) * limit;
-    const q = (req.query.q || '').trim();
-    const sort = (req.query.sort || 'lastLogin').toString();
-    const bannedFilter = req.query.banned;
+    const page  = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(500, Math.max(1, parseInt(req.query.limit, 10) || 100));
+    const skip  = (page - 1) * limit;
+    const q     = (req.query.q || '').trim();
+    const sort  = (req.query.sort || 'lastLogin').toString();
+    const bannedFilter       = req.query.banned;
+    const authProviderFilter = req.query.authProvider;
+
     const filter = {};
     if (q) {
       filter.$or = [
         { username: { $regex: q, $options: 'i' } },
-        { email: { $regex: q, $options: 'i' } },
+        { email:    { $regex: q, $options: 'i' } },
       ];
     }
-    if (bannedFilter === 'true' || bannedFilter === '1') filter.banned = true;
+    if (bannedFilter === 'true'  || bannedFilter === '1') filter.banned = true;
     else if (bannedFilter === 'false' || bannedFilter === '0') filter.banned = { $ne: true };
+    if (authProviderFilter === 'local' || authProviderFilter === 'google') {
+      filter.authProvider = authProviderFilter;
+    }
 
-    const sortOpt = {};
-    if (sort === 'points') sortOpt.points = -1;
-    else if (sort === 'hints') sortOpt.hints = -1;
-    else sortOpt.lastLogin = -1;
+    // totalCleared sort: computed in MongoDB with $addFields, no in-memory sort
     if (sort === 'totalCleared') {
-      const maxTotalCleared = 5000;
-      const [users, total] = await Promise.all([
-        User().find(filter).lean().limit(maxTotalCleared),
+      const [result, total] = await Promise.all([
+        User().aggregate([
+          { $match: filter },
+          { $addFields: { totalCleared: { $add: [
+            { $ifNull: ['$levelPassedEasy',   0] },
+            { $ifNull: ['$levelPassedMedium', 0] },
+            { $ifNull: ['$levelPassedHard',   0] },
+          ]}}},
+          { $sort: { totalCleared: -1 } },
+          { $skip: skip },
+          { $limit: limit },
+          { $project: { ...USER_LIST_PROJECTION, totalCleared: 1 } },
+        ]),
         User().countDocuments(filter),
       ]);
-      const withTotal = users.map((u) => ({
-        ...u,
-        totalCleared: (u.levelPassedEasy || 0) + (u.levelPassedMedium || 0) + (u.levelPassedHard || 0),
-      }));
-      withTotal.sort((a, b) => (b.totalCleared || 0) - (a.totalCleared || 0));
-      const paginated = withTotal.slice(skip, skip + limit);
-      res.json({ success: true, users: paginated, total: Math.min(total, withTotal.length), page, limit });
+      res.json({ success: true, users: result, total, page, limit });
       return;
     }
 
+    const sortOpt = sort === 'points' ? { points: -1 }
+                  : sort === 'hints'  ? { hints: -1 }
+                  : { lastLogin: -1 };
+
     const [users, total] = await Promise.all([
-      User().find(filter).sort(sortOpt).skip(skip).limit(limit).lean(),
+      User().find(filter, USER_LIST_PROJECTION).sort(sortOpt).skip(skip).limit(limit).lean(),
       User().countDocuments(filter),
     ]);
     res.json({ success: true, users, total, page, limit });
@@ -101,8 +118,10 @@ router.put('/:username', requireAdmin, requirePermission('users:write'), async (
 
 router.get('/:username/referrals', requireAdmin, requirePermission('users:read', 'referrals:read'), async (req, res) => {
   try {
-    const referred = await User().find({ referredBy: { $regex: new RegExp(`^${req.params.username}`) } })
-      .select('username email referredBy createdAt').lean();
+    // Exact match on referredBy (uses the referredBy index) instead of a regex scan
+    const referred = await User()
+      .find({ referredBy: req.params.username }, { username: 1, email: 1, referredBy: 1, createdAt: 1 })
+      .lean();
     res.json({ success: true, referrals: referred });
   } catch (err) {
     console.error('Admin referrals list error:', err);
@@ -152,6 +171,51 @@ router.delete('/:username/ban', requireAdmin, requirePermission('users:ban'), as
   } catch (err) {
     console.error('Admin user unban error:', err);
     res.status(500).json({ success: false, message: 'Failed to unban user.' });
+  }
+});
+
+// DELETE /api/admin/users/:username — permanently delete user + all related records
+// Uses POST method to allow a JSON body with the typed confirmation token
+router.post('/:username/delete', requireAdmin, requirePermission('users:write'), async (req, res) => {
+  try {
+    const { username } = req.params;
+
+    // Require typed confirmation in the request body to prevent accidental deletes
+    const { confirm } = req.body || {};
+    if (confirm !== username) {
+      return res.status(400).json({ success: false, message: 'Confirmation does not match username.' });
+    }
+
+    const user = await User().findOne({ username });
+    if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
+
+    const PurchaseHistoryModel = PurchaseHistory();
+
+    // Delete all related records in parallel
+    const [purchaseResult] = await Promise.all([
+      PurchaseHistoryModel
+        ? PurchaseHistoryModel.deleteMany({ username })
+        : Promise.resolve({ deletedCount: 0 }),
+    ]);
+
+    // Delete the user document
+    await User().deleteOne({ username });
+
+    await audit(req, 'user.delete', `user:${username}`, {
+      purchasesDeleted: purchaseResult?.deletedCount ?? 0,
+    });
+
+    res.json({
+      success: true,
+      message: `User "${username}" and all related records have been permanently deleted.`,
+      deleted: {
+        user: 1,
+        purchases: purchaseResult?.deletedCount ?? 0,
+      },
+    });
+  } catch (err) {
+    console.error('Admin user delete error:', err);
+    res.status(500).json({ success: false, message: 'Failed to delete user.' });
   }
 });
 

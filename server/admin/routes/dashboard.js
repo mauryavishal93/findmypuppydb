@@ -18,84 +18,120 @@ router.get('/stats', requireAdmin, requirePermission('analytics:read', 'users:re
     }
 
     const now = new Date();
-    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    const startOfYesterday = new Date(startOfToday);
-    startOfYesterday.setDate(startOfYesterday.getDate() - 1);
-    const endOfYesterday = new Date(startOfToday.getTime() - 1);
-    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const startOfToday     = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const startOfYesterday = new Date(startOfToday); startOfYesterday.setDate(startOfYesterday.getDate() - 1);
+    const startOfMonth     = new Date(now.getFullYear(), now.getMonth(), 1);
     const startOfLastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
-    const endOfLastMonth = new Date(startOfMonth.getTime() - 1);
+    const sevenDaysAgo     = new Date(startOfToday); sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 6);
 
-    const [
-      totalUsers,
-      todayLogins,
-      monthLogins,
-      lastMonthLogins,
-      revenueToday,
-      revenueYesterday,
-      revenueMonth,
-      revenueLastMonth,
-      revenueTotal,
-      hintsSold,
-    ] = await Promise.all([
-      UserModel.countDocuments({}),
-      UserModel.countDocuments({ lastLogin: { $gte: startOfToday } }),
-      UserModel.countDocuments({ lastLogin: { $gte: startOfMonth } }),
-      UserModel.countDocuments({ lastLogin: { $gte: startOfLastMonth, $lt: startOfMonth } }),
+    // ── Single-pass user aggregation ─────────────────────────────────────────
+    // Counts totalUsers, DAU, MAU, last-month logins, and 7-day DAU breakdown
+    // in one pipeline instead of 4 separate countDocuments calls.
+    const [userAgg, purchaseAgg] = await Promise.all([
+
+      UserModel.aggregate([
+        {
+          $facet: {
+            total:     [{ $count: 'n' }],
+            dau:       [{ $match: { lastLogin: { $gte: startOfToday } } },     { $count: 'n' }],
+            mau:       [{ $match: { lastLogin: { $gte: startOfMonth } } },     { $count: 'n' }],
+            lastMonth: [{ $match: { lastLogin: { $gte: startOfLastMonth, $lt: startOfMonth } } }, { $count: 'n' }],
+            // 7-day sparkline DAU: bucket by day
+            dauByDay: [
+              { $match: { lastLogin: { $gte: sevenDaysAgo } } },
+              { $group: {
+                _id: {
+                  y: { $year: '$lastLogin' },
+                  m: { $month: '$lastLogin' },
+                  d: { $dayOfMonth: '$lastLogin' },
+                },
+                count: { $sum: 1 },
+              }},
+            ],
+          },
+        },
+      ]),
+
+      // ── Single-pass purchase aggregation ─────────────────────────────────
+      // All revenue buckets + hints stats in one pipeline pass.
       PurchaseHistoryModel.aggregate([
-        { $match: { purchaseDate: { $gte: startOfToday }, purchaseMode: 'Money', amount: { $gt: 0 } } },
-        { $group: { _id: null, total: { $sum: '$amount' } } },
-      ]).then((r) => (r[0] && r[0].total) || 0),
-      PurchaseHistoryModel.aggregate([
-        { $match: { purchaseDate: { $gte: startOfYesterday, $lte: endOfYesterday }, purchaseMode: 'Money', amount: { $gt: 0 } } },
-        { $group: { _id: null, total: { $sum: '$amount' } } },
-      ]).then((r) => (r[0] && r[0].total) || 0),
-      PurchaseHistoryModel.aggregate([
-        { $match: { purchaseDate: { $gte: startOfMonth }, purchaseMode: 'Money', amount: { $gt: 0 } } },
-        { $group: { _id: null, total: { $sum: '$amount' } } },
-      ]).then((r) => (r[0] && r[0].total) || 0),
-      PurchaseHistoryModel.aggregate([
-        { $match: { purchaseDate: { $gte: startOfLastMonth, $lte: endOfLastMonth }, purchaseMode: 'Money', amount: { $gt: 0 } } },
-        { $group: { _id: null, total: { $sum: '$amount' } } },
-      ]).then((r) => (r[0] && r[0].total) || 0),
-      PurchaseHistoryModel.aggregate([
-        { $match: { purchaseMode: 'Money', amount: { $gt: 0 } } },
-        { $group: { _id: null, total: { $sum: '$amount' } } },
-      ]).then((r) => (r[0] && r[0].total) || 0),
-      PurchaseHistoryModel.countDocuments({ purchaseType: 'Hints' }),
+        {
+          $facet: {
+            revenueToday: [
+              { $match: { purchaseMode: 'Money', amount: { $gt: 0 }, purchaseDate: { $gte: startOfToday } } },
+              { $group: { _id: null, total: { $sum: '$amount' } } },
+            ],
+            revenueYesterday: [
+              { $match: { purchaseMode: 'Money', amount: { $gt: 0 }, purchaseDate: { $gte: startOfYesterday, $lt: startOfToday } } },
+              { $group: { _id: null, total: { $sum: '$amount' } } },
+            ],
+            revenueMonth: [
+              { $match: { purchaseMode: 'Money', amount: { $gt: 0 }, purchaseDate: { $gte: startOfMonth } } },
+              { $group: { _id: null, total: { $sum: '$amount' } } },
+            ],
+            revenueLastMonth: [
+              { $match: { purchaseMode: 'Money', amount: { $gt: 0 }, purchaseDate: { $gte: startOfLastMonth, $lt: startOfMonth } } },
+              { $group: { _id: null, total: { $sum: '$amount' } } },
+            ],
+            revenueTotal: [
+              { $match: { purchaseMode: 'Money', amount: { $gt: 0 } } },
+              { $group: { _id: null, total: { $sum: '$amount' } } },
+            ],
+            razorpayHints: [
+              { $match: { purchaseType: 'Hints', purchaseMode: 'Money', purchaseId: { $regex: /^pay_/ } } },
+              { $group: { _id: null, hints: { $sum: '$hintsCount' }, txns: { $sum: 1 } } },
+            ],
+            freeHints: [
+              { $match: { purchaseType: 'Hints', purchaseMode: { $in: ['Points', 'Referral'] } } },
+              { $group: { _id: null, hints: { $sum: '$hintsCount' }, txns: { $sum: 1 } } },
+            ],
+            // 7-day sparkline revenue: bucket by day
+            revenueByDay: [
+              { $match: { purchaseMode: 'Money', amount: { $gt: 0 }, purchaseDate: { $gte: sevenDaysAgo } } },
+              { $group: {
+                _id: {
+                  y: { $year: '$purchaseDate' },
+                  m: { $month: '$purchaseDate' },
+                  d: { $dayOfMonth: '$purchaseDate' },
+                },
+                total: { $sum: '$amount' },
+              }},
+            ],
+          },
+        },
+      ]),
     ]);
 
-    const MAU = monthLogins;
-    const DAU = todayLogins;
+    // ── Unpack user aggregation ───────────────────────────────────────────────
+    const ua = userAgg[0];
+    const totalUsers  = ua.total[0]?.n     ?? 0;
+    const DAU         = ua.dau[0]?.n       ?? 0;
+    const MAU         = ua.mau[0]?.n       ?? 0;
 
-    // Last 7 days: DAU and revenue per day for sparklines
-    const last7Days = [];
-    for (let i = 6; i >= 0; i--) {
-      const d = new Date(now);
-      d.setDate(d.getDate() - i);
-      const dayStart = new Date(d.getFullYear(), d.getMonth(), d.getDate());
-      const dayEnd = new Date(dayStart);
-      dayEnd.setDate(dayEnd.getDate() + 1);
-      last7Days.push({ date: dayStart.toISOString().slice(0, 10), dayStart, dayEnd });
+    // Build a lookup map for DAU by day: "YYYY-M-D" → count
+    const dauMap = {};
+    for (const b of ua.dauByDay) {
+      dauMap[`${b._id.y}-${b._id.m}-${b._id.d}`] = b.count;
     }
-    const dauByDay = await Promise.all(
-      last7Days.map(({ dayStart, dayEnd }) =>
-        UserModel.countDocuments({ lastLogin: { $gte: dayStart, $lt: dayEnd } })
-      )
-    );
-    const revenueByDay = await Promise.all(
-      last7Days.map(({ dayStart, dayEnd }) =>
-        PurchaseHistoryModel.aggregate([
-          { $match: { purchaseDate: { $gte: dayStart, $lt: dayEnd }, purchaseMode: 'Money', amount: { $gt: 0 } } },
-          { $group: { _id: null, total: { $sum: '$amount' } } },
-        ]).then((r) => (r[0] && r[0].total) ? Math.round(r[0].total * 100) / 100 : 0)
-      )
-    );
-    const sparkline = last7Days.map(({ date }, i) => ({
-      date,
-      dau: dauByDay[i],
-      revenue: revenueByDay[i],
-    }));
+
+    // ── Unpack purchase aggregation ───────────────────────────────────────────
+    const pa = purchaseAgg[0];
+    const r = (facet) => Math.round(((facet[0]?.total) || 0) * 100) / 100;
+
+    const revenueMap = {};
+    for (const b of pa.revenueByDay) {
+      revenueMap[`${b._id.y}-${b._id.m}-${b._id.d}`] = Math.round((b.total || 0) * 100) / 100;
+    }
+
+    // ── Build 7-day sparkline ─────────────────────────────────────────────────
+    const sparkline = [];
+    for (let i = 6; i >= 0; i--) {
+      const d = new Date(startOfToday);
+      d.setDate(d.getDate() - i);
+      const key  = `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
+      const date = d.toISOString().slice(0, 10);
+      sparkline.push({ date, dau: dauMap[key] ?? 0, revenue: revenueMap[key] ?? 0 });
+    }
 
     res.json({
       success: true,
@@ -103,12 +139,15 @@ router.get('/stats', requireAdmin, requirePermission('analytics:read', 'users:re
         dau: DAU,
         mau: MAU,
         totalUsers,
-        revenueToday: Math.round(revenueToday * 100) / 100,
-        revenueYesterday: Math.round(revenueYesterday * 100) / 100,
-        revenueMonth: Math.round(revenueMonth * 100) / 100,
-        revenueLastMonth: Math.round(revenueLastMonth * 100) / 100,
-        revenueTotal: Math.round(revenueTotal * 100) / 100,
-        hintsSold,
+        revenueToday:     r(pa.revenueToday),
+        revenueYesterday: r(pa.revenueYesterday),
+        revenueMonth:     r(pa.revenueMonth),
+        revenueLastMonth: r(pa.revenueLastMonth),
+        revenueTotal:     r(pa.revenueTotal),
+        hintsSoldMoney:     pa.razorpayHints[0]?.hints ?? 0,
+        hintsSoldMoneyTxns: pa.razorpayHints[0]?.txns  ?? 0,
+        hintsSoldFree:      pa.freeHints[0]?.hints     ?? 0,
+        hintsSoldFreeTxns:  pa.freeHints[0]?.txns      ?? 0,
         failedPayments: 0,
         serverHealth: 'ok',
         sparkline,
@@ -120,76 +159,49 @@ router.get('/stats', requireAdmin, requirePermission('analytics:read', 'users:re
   }
 });
 
-// Get DAU users list (last 24 hours)
+// Shared projection for DAU/MAU user lists — only fields the table renders
+const ACTIVE_USER_PROJECTION = {
+  username: 1, email: 1, lastLogin: 1, authProvider: 1,
+  points: 1, hints: 1,
+  levelPassedEasy: 1, levelPassedMedium: 1, levelPassedHard: 1,
+};
+
+// Get DAU users list (logged in today)
 router.get('/dau-users', requireAdmin, requirePermission('analytics:read', 'users:read'), async (req, res) => {
   try {
     const UserModel = mongoose.models.User;
-    if (!UserModel) {
-      return res.status(500).json({ success: false, message: 'Models not available.' });
-    }
+    if (!UserModel) return res.status(500).json({ success: false, message: 'Models not available.' });
 
     const now = new Date();
     const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
 
-    const dauUsers = await UserModel.find(
-      { lastLogin: { $gte: startOfToday } },
-      { username: 1, email: 1, lastLogin: 1, points: 1, hints: 1, levelPassedEasy: 1, levelPassedMedium: 1, levelPassedHard: 1 }
-    )
+    const users = await UserModel
+      .find({ lastLogin: { $gte: startOfToday } }, ACTIVE_USER_PROJECTION)
       .sort({ lastLogin: -1 })
       .lean();
 
-    res.json({
-      success: true,
-      users: dauUsers.map(u => ({
-        username: u.username,
-        email: u.email,
-        lastLogin: u.lastLogin,
-        points: u.points || 0,
-        hints: u.hints || 0,
-        levelPassedEasy: u.levelPassedEasy || 0,
-        levelPassedMedium: u.levelPassedMedium || 0,
-        levelPassedHard: u.levelPassedHard || 0,
-      })),
-      count: dauUsers.length,
-    });
+    res.json({ success: true, users, count: users.length });
   } catch (err) {
     console.error('DAU users error:', err);
     res.status(500).json({ success: false, message: 'Failed to load DAU users.' });
   }
 });
 
-// Get MAU users list (last 30 days)
+// Get MAU users list (logged in this calendar month)
 router.get('/mau-users', requireAdmin, requirePermission('analytics:read', 'users:read'), async (req, res) => {
   try {
     const UserModel = mongoose.models.User;
-    if (!UserModel) {
-      return res.status(500).json({ success: false, message: 'Models not available.' });
-    }
+    if (!UserModel) return res.status(500).json({ success: false, message: 'Models not available.' });
 
     const now = new Date();
     const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
 
-    const mauUsers = await UserModel.find(
-      { lastLogin: { $gte: startOfMonth } },
-      { username: 1, email: 1, lastLogin: 1, points: 1, hints: 1, levelPassedEasy: 1, levelPassedMedium: 1, levelPassedHard: 1 }
-    )
+    const users = await UserModel
+      .find({ lastLogin: { $gte: startOfMonth } }, ACTIVE_USER_PROJECTION)
       .sort({ lastLogin: -1 })
       .lean();
 
-    res.json({
-      success: true,
-      users: mauUsers.map(u => ({
-        username: u.username,
-        email: u.email,
-        lastLogin: u.lastLogin,
-        points: u.points || 0,
-        hints: u.hints || 0,
-        levelPassedEasy: u.levelPassedEasy || 0,
-        levelPassedMedium: u.levelPassedMedium || 0,
-        levelPassedHard: u.levelPassedHard || 0,
-      })),
-      count: mauUsers.length,
-    });
+    res.json({ success: true, users, count: users.length });
   } catch (err) {
     console.error('MAU users error:', err);
     res.status(500).json({ success: false, message: 'Failed to load MAU users.' });

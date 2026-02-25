@@ -11,6 +11,7 @@ import gameplay from './gameplay.js';
 import security from './security.js';
 import shop from './shop.js';
 import maintenance from './maintenance.js';
+import referrals from './referrals.js';
 
 const router = Router();
 
@@ -21,13 +22,13 @@ router.use('/gameplay', gameplay);
 router.use('/security', security);
 router.use('/shop', shop);
 router.use('/maintenance', maintenance);
+router.use('/referrals', referrals);
 
 // Placeholder routes (return 501 until implemented)
 const notImplemented = (req, res) => res.status(501).json({ success: false, message: 'Not implemented yet.' });
 
 router.use('/scenes', (req, res, next) => notImplemented(req, res));
 router.use('/hints', (req, res, next) => notImplemented(req, res));
-router.use('/referrals', (req, res, next) => notImplemented(req, res));
 router.use('/dailycheckin', (req, res, next) => notImplemented(req, res));
 router.use('/leaderboard', (req, res, next) => notImplemented(req, res));
 router.use('/themes', (req, res, next) => notImplemented(req, res));
